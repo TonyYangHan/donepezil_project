@@ -34,13 +34,20 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     
     fad = cv2.imread(os.path.join(root_path, fad_path), cv2.IMREAD_UNCHANGED)
     nadh = cv2.imread(os.path.join(root_path, nadh_path), cv2.IMREAD_UNCHANGED)
-    fad8 = cv2.convertScaleAbs(fad, alpha=255.0 / float(fad.max()))
-    _, mask8 = cv2.threshold(fad8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    fad = np.where(fad == 4095, 0, fad)  # Remove saturated pixels
+    nadh = np.where(nadh == 4095, 0, nadh)  # Remove saturated pixels
+
+    sat_mask = (fad == 4095) | (nadh == 4095)  # union of saturated pixels
+    fad[sat_mask] = 0
+    nadh[sat_mask] = 0
+
+    mask8 = np.ones_like(fad, dtype=np.float32)
+    if use_mask:
+        fad8 = cv2.convertScaleAbs(fad, alpha=255.0 / float(fad.max()))
+        _, mask8 = cv2.threshold(fad8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
     f = fad.astype(np.float32)
     n = nadh.astype(np.float32)
-
-    if use_mask == False:
-        mask8 = np.ones_like(f, dtype=np.float32)
     
     if suffix in ["redox", "unsat"]:
         den = f + n
@@ -48,11 +55,13 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
         ratio = (f / den) * mask8
     elif suffix in ["protein_turn", "lipid_turn"]:
         n[n == 0] = np.finfo(np.float32).eps # Avoid division by zero
-        ratio = (f / n) * mask8
+        ratio = (f / n) * mask8 / 2 # CD channel use twice the power compared to CH channel
     else:
         raise ValueError("Suffix must be one of 'redox', 'unsat', 'protein_turn', or 'lipid_turn'.")
     
-    ratio = np.clip(ratio, 0, 5)  # Ensure no negative values
+    low, high = 0, 0.9
+    ratio[(ratio < low) | (ratio > high)] = 0
+
 
     if save:
         save_name = get_number(fad_path) + f'_{suffix}_ratio.png'
