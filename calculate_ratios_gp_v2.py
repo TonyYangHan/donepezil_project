@@ -1,10 +1,9 @@
-import os, numpy as np, cv2, argparse, math, itertools
+import os, numpy as np, cv2, argparse, tifffile as tiff
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt, matplotlib.colors as mcolors
 import re
 from scipy.stats import ttest_ind, mannwhitneyu
-from concurrent.futures import ThreadPoolExecutor
 
 
 
@@ -66,7 +65,7 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     if save:
         save_name = get_number(fad_path) + f'_{suffix}_ratio.png'
         save_ratio_image(ratio, root_path, save_name, low_pct, high_pct, gamma, cbar)
-
+        tiff.imwrite(os.path.join(root_path, get_number(fad_path) + f'_{suffix}_ratio.tiff'), ratio.astype(np.float32))
     return ratio
 
 
@@ -112,20 +111,6 @@ def flatten_and_filter(ratio_list):
 
 
 
-def run_mannwhitney_pixels(cond1_ratios, cond2_ratios, label="redox"):
-    cond1_vals = flatten_and_filter(cond1_ratios)
-    cond2_vals = flatten_and_filter(cond2_ratios)
-    # Exclude zeros
-    cond1_vals = cond1_vals[cond1_vals != 0]
-    cond2_vals = cond2_vals[cond2_vals != 0]
-    u_stat, p_val = mannwhitneyu(cond1_vals, cond2_vals, alternative='two-sided')
-    print(f"Mann-Whitney U test for {label} (all pixels): U={u_stat:.4f}, p={p_val}")
-    print(f"cond1 median: {np.median(cond1_vals):.4f}, cond2 median: {np.median(cond2_vals):.4f}")
-    print()
-    return u_stat, p_val
-
-
-
 def run_test_image_mean(cond1_ratios, cond2_ratios, label="redox"):
 
     cond1_means = [np.mean(r) for r in cond1_ratios if r is not None]
@@ -141,71 +126,66 @@ def run_test_image_mean(cond1_ratios, cond2_ratios, label="redox"):
     return t_stat, p_val
 
 
-
-def sample_pixels_for_ttest(ratio_list):
-    # For each image, sample img_size_per_image pixels (excluding zeros)
-    n_images = len(ratio_list)
-    samples = []
-    for arr in ratio_list:
-        vals = arr.ravel()
-        vals = vals[vals != 0]
-        # img_size_per_image = int(len(vals) / n_images)
-        img_size_per_image = 500
-        # np.random.seed(42)  # For reproducibility
-        samples.append(np.random.choice(vals, img_size_per_image, replace=False))
-
-    return np.concatenate(samples)
-
-def repeated_ttest_sampling(cond1_ratios, cond2_ratios, n_repeat=50, label="redox"):
-    # Each combined sample will have ~number of pixels in one image
-    def single_run(_):
-        cond1_sample = sample_pixels_for_ttest(cond1_ratios)
-        cond2_sample = sample_pixels_for_ttest(cond2_ratios)
-        t_stat, p_val = ttest_ind(cond1_sample, cond2_sample, equal_var=False)
-        return p_val
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        p_values = list(executor.map(single_run, range(n_repeat)))
-    avg_p = np.mean(p_values)
-    print(f"Average p-value over {n_repeat} runs for {label} : {avg_p}")
-    return p_values, avg_p
+def _block_medians_from_image(arr: np.ndarray, block_size: int) -> np.ndarray:
+    """Compute per-block medians for non-overlapping blocks.
+    Discard blocks whose sum is 0. Returns a 1D array of medians.
+    """
+    if arr is None:
+        raise ValueError("Input array is None.")
+    a = np.asarray(arr, dtype=float)
+    h, w = a.shape[:2]
+    if h < block_size or w < block_size:
+        raise ValueError("Image is smaller than block size.")
+    bh = h // block_size
+    bw = w // block_size
+    if bh == 0 or bw == 0:
+        raise ValueError("Image is smaller than block size.")
+    a = a[: bh * block_size, : bw * block_size]
+    # reshape to (bh, block_size, bw, block_size)
+    a4 = a.reshape(bh, block_size, bw, block_size)
+    # sums and medians per block
+    block_sums = a4.sum(axis=(1, 3))            # shape (bh, bw)
+    block_meds = np.median(a4, axis=(1, 3))     # shape (bh, bw)
+    mask = block_sums != 0
+    return block_meds[mask].ravel()
 
 
+def run_block_median_ttest(cond1_ratios, cond2_ratios, block_size: int = 16, label: str = "redox"):
+    """Block-median t-test between two conditions.
 
-def quantile_perm_energy(cond1, cond2, qs=np.arange(0.05, 1.00, 0.05)):
-    """Two-sample test on per-sample quantile vectors using energy distance + exact permutations.
-       cond1/cond2: lists of arrays (pixels per image/sample)."""
-    def qvec(arr):
-        v = np.asarray(arr, float).ravel()
-        v = v[v > 0]          # drop zeros
-        v = np.log(v)         # log-scale for ratios
-        return np.quantile(v, qs)
+    For each image, partition into non-overlapping block_size x block_size blocks,
+    discard blocks whose sum is 0, and use the median within each block as its value.
+    Concatenate all valid block medians per condition and run Welch's t-test.
 
-    A = np.vstack([qvec(a) for a in cond1])
-    B = np.vstack([qvec(b) for b in cond2])
-    X = np.vstack([A, B])
-    labels = np.array([1]*len(A) + [0]*len(B), int)
-    nA, N = int(labels.sum()), len(labels)
+    Returns (t_stat, p_val, n_blocks_cond1, n_blocks_cond2). If insufficient data,
+    returns (None, None, 0, 0).
+    """
+    bs = int(block_size)
+    c1_vals = []
+    c2_vals = []
 
-    def mean_pairwise_dist(U, V):
-        D = U[:, None, :] - V[None, :, :]
-        return np.sqrt((D*D).sum(-1)).mean()
+    for arr in cond1_ratios:
+        if arr is None:
+            continue
+        c1_vals.append(_block_medians_from_image(arr, bs))
+    for arr in cond2_ratios:
+        if arr is None:
+            continue
+        c2_vals.append(_block_medians_from_image(arr, bs))
 
-    def energy_stat(lab):
-        Xa, Xb = X[lab == 1], X[lab == 0]
-        return 2*mean_pairwise_dist(Xa, Xb) - mean_pairwise_dist(Xa, Xa) - mean_pairwise_dist(Xb, Xb)
+    c1 = np.concatenate(c1_vals) if len(c1_vals) else np.array([], dtype=float)
+    c2 = np.concatenate(c2_vals) if len(c2_vals) else np.array([], dtype=float)
 
-    T_obs = energy_stat(labels)
+    n1, n2 = c1.size, c2.size
+    if n1 == 0 or n2 == 0:
+        print(f"Block-median t-test for {label}: insufficient data (n1={n1}, n2={n2}).")
+        return None, None, n1, n2
 
-    # exact permutations over sample labels
-    b = 0
-    Btot = math.comb(N, nA)
-    for Aidx in itertools.combinations(range(N), nA):
-        lab = np.zeros(N, int); lab[list(Aidx)] = 1
-        if energy_stat(lab) >= T_obs:  # one-sided on separation
-            b += 1
-
-    p = (b + 1) / (Btot + 1)  # small-sample correction
-    return {"p": p, "E": T_obs, "qs": qs, "meanA": A.mean(0), "meanB": B.mean(0)}
+    t_stat, p_val = ttest_ind(c1, c2, equal_var=False)
+    u_stat, p_val_mw = mannwhitneyu(c1, c2)
+    print(f"Block-median t-test for {label} (block {bs}x{bs}): t={t_stat:.4f}, p={p_val} | n1={n1}, n2={n2}")
+    print(f"Block-median Mann-Whitney U test for {label} (block {bs}x{bs}): U={u_stat:.4f}, p={p_val_mw}")
+    return t_stat, p_val, n1, n2
 
 
 
@@ -289,12 +269,11 @@ if __name__ == "__main__":
     parser.add_argument("--cond2", type=str, default="cond2", help="Label for condition 2")
     parser.add_argument("--mean", "-m", action="store_true", help="Run t-test on image means")
     parser.add_argument("--save", "-s", action="store_true", help="Save ratio images")
-    parser.add_argument("--ranksum", "-r", help="Run rank-sum (Mann-Whitney U) test", action="store_true")
-    parser.add_argument("--ttest", "-t", help="Run repeated t-test", action="store_true")
-    parser.add_argument("--q_test", "-q", help="Run quantile test", action="store_true")
     parser.add_argument("--plot", "-p", help="Plot histograms", action="store_true")
     parser.add_argument("--out", "-o", type=str, default=".", help="Root directory for saving outputs")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--block-ttest", "-b", action="store_true", help="Run block-median t-test")
+    parser.add_argument("--block-size", type=int, default=16, help="Block size for block-median t-test (default: 16)")
     args = parser.parse_args()
 
     save = args.save
@@ -322,52 +301,6 @@ if __name__ == "__main__":
         print(f"Found {len(cond1_turn_protein) if cond1_turn_protein else 0} cond1 protein images and {len(cond2_turn_protein) if cond2_turn_protein else 0} cond2 protein images.")
         print(f"Found {len(cond1_turn_lipid) if cond1_turn_lipid else 0} cond1 lipid images and {len(cond2_turn_lipid) if cond2_turn_lipid else 0} cond2 lipid images.")
 
-    # Run Mann-Whitney U tests
-    if args.ranksum:
-        print("Running Mann-Whitney U tests...")
-        u_redox, p_redox = run_mannwhitney_pixels(cond1_redox, cond2_redox, label="redox")
-        print()
-        u_unsat, p_unsat = run_mannwhitney_pixels(cond1_unsat, cond2_unsat, label="unsat")
-        print()
-        # Plot violin plots with stats
-        plot_violins_with_stats(cond1_redox, cond2_redox, label="redox", cond1=cond1, cond2=cond2,
-                                outdir=args.out, p_val=p_redox, test_name="MWU")
-        plot_violins_with_stats(cond1_unsat, cond2_unsat, label="unsat", cond1=cond1, cond2=cond2,
-                                outdir=args.out, p_val=p_unsat, test_name="MWU")
-
-        if args.d:
-            u_protein, p_protein = run_mannwhitney_pixels(cond1_turn_protein, cond2_turn_protein, label="protein_turn")
-            print()
-            u_lipid, p_lipid = run_mannwhitney_pixels(cond1_turn_lipid, cond2_turn_lipid, label="lipid_turn")
-            print()
-            plot_violins_with_stats(cond1_turn_protein, cond2_turn_protein, label="protein_turn",
-                                    cond1=cond1, cond2=cond2, outdir=args.out, p_val=p_protein, test_name="MWU")
-            plot_violins_with_stats(cond1_turn_lipid, cond2_turn_lipid, label="lipid_turn",
-                                    cond1=cond1, cond2=cond2, outdir=args.out, p_val=p_lipid, test_name="MWU")
-
-    # Run repeated t-tests
-    if args.ttest:
-        print("Running repeated t-tests...")
-
-        ttest_pvals_redox, avg_p_redox = repeated_ttest_sampling(cond1_redox, cond2_redox, n_repeat=500, label="redox")
-        ttest_pvals_unsat, avg_p_unsat = repeated_ttest_sampling(cond1_unsat, cond2_unsat, n_repeat=500, label="unsat")
-        print()
-
-        # Plot violin plots with stats (using average p-value)
-        plot_violins_with_stats(cond1_redox, cond2_redox, label="redox", cond1=cond1, cond2=cond2,
-                                outdir=args.out, p_val=avg_p_redox, test_name="t-test")
-        plot_violins_with_stats(cond1_unsat, cond2_unsat, label="unsat", cond1=cond1, cond2=cond2,
-                                outdir=args.out, p_val=avg_p_unsat, test_name="t-test")
-
-        if args.d:
-            ttest_pvals_protein, avg_p_protein = repeated_ttest_sampling(cond1_turn_protein, cond2_turn_protein, n_repeat=500, label="protein_turn")
-            ttest_pvals_lipid, avg_p_lipid = repeated_ttest_sampling(cond1_turn_lipid, cond2_turn_lipid, n_repeat=500, label="lipid_turn")
-            print()
-            plot_violins_with_stats(cond1_turn_protein, cond2_turn_protein, cond1=cond1, cond2=cond2,
-                                    label="protein_turn", outdir=args.out, p_val=avg_p_protein, test_name="t-test")
-            plot_violins_with_stats(cond1_turn_lipid, cond2_turn_lipid, cond1=cond1, cond2=cond2,
-                                    label="lipid_turn", outdir=args.out, p_val=avg_p_lipid, test_name="t-test")
-
     if args.mean:
         print("Running t-tests on image means...")
 
@@ -381,25 +314,29 @@ if __name__ == "__main__":
             print()
             run_test_image_mean(cond1_turn_lipid, cond2_turn_lipid, label="lipid_turn")
             print()
-    
-    if args.q_test:
-        print("Running quantile tests...")
-        res = quantile_perm_energy(cond1_redox, cond2_redox)
-        print("p =", res["p"], "Energy =", res["E"])
+
+    if args.block_ttest:
+        print("Running block-median t-tests...")
+        _, p_val_redox, _, _ = run_block_median_ttest(cond1_redox, cond2_redox, block_size=args.block_size, label="redox")
+        print()
+        _, p_val_unsat, _, _ = run_block_median_ttest(cond1_unsat, cond2_unsat, block_size=args.block_size, label="unsat")
         print()
 
-        q_unsat = quantile_perm_energy(cond1_unsat, cond2_unsat)
-        print(f"Quantile test for unsat: p={q_unsat['p']}, Energy={q_unsat['E']}")
-        print()
+        plot_violins_with_stats(cond1_redox, cond2_redox, cond1=cond1, cond2=cond2,
+                                label="redox", outdir=args.out, p_val=p_val_redox, test_name="Block-median t-test")
+        plot_violins_with_stats(cond1_unsat, cond2_unsat, cond1=cond1, cond2=cond2,
+                                label="unsat", outdir=args.out, p_val=p_val_unsat, test_name="Block-median t-test")
 
         if args.d:
-            q_protein = quantile_perm_energy(cond1_turn_protein, cond2_turn_protein)
-            print(f"Quantile test for protein_turn: p={q_protein['p']}, Energy={q_protein['E']}")
+            _, p_val_pt, _, _ = run_block_median_ttest(cond1_turn_protein, cond2_turn_protein, block_size=args.block_size, label="protein_turn")
+            print()
+            _, p_val_lt, _, _ = run_block_median_ttest(cond1_turn_lipid, cond2_turn_lipid, block_size=args.block_size, label="lipid_turn")
             print()
 
-            q_lipid = quantile_perm_energy(cond1_turn_lipid, cond2_turn_lipid)
-            print(f"Quantile test for lipid_turn: p={q_lipid['p']}, Energy={q_lipid['E']}")
-            print()
+            plot_violins_with_stats(cond1_turn_protein, cond2_turn_protein, cond1=cond1, cond2=cond2,
+                                    label="protein_turn", outdir=args.out, p_val=p_val_pt, test_name="Block-median t-test")
+            plot_violins_with_stats(cond1_turn_lipid, cond2_turn_lipid, cond1=cond1, cond2=cond2,
+                                    label="lipid_turn", outdir=args.out, p_val=p_val_lt, test_name="Block-median t-test")
 
     # Plot histograms
     if args.plot:
