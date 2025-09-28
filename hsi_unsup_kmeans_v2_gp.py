@@ -191,31 +191,37 @@ def preprocess_all_stacks(stacks, baseline_interpolator, wavenumbers,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hyperspectral SRS Image Analysis for multiple directories.")
-    parser.add_argument("root_dir", type=str)
+    parser.add_argument("dir_1", type=str)
+    parser.add_argument("dir_2", type=str)
     parser.add_argument("dir_substr", type=str)
     parser.add_argument("baseline_path", type=str, help="Path to water baseline CSV")
-    parser.add_argument("--cond_1", type=str, default="young")
-    parser.add_argument("--cond_2", type=str, default="old")
+    parser.add_argument("--cond_1", type=str, required=True)
+    parser.add_argument("--cond_2", type=str, required=True)
     parser.add_argument("--n_clusters", "-n", type=int, default=6)
     parser.add_argument("--spectra_start", type=float, default=2700)
     parser.add_argument("--spectra_end", type=float, default=3100)
     parser.add_argument("--expected_channels", "-c", type=int, default=62)
     parser.add_argument("--mask", "-m", action = "store_true", help = "Use existing masks")
     parser.add_argument("--sam", "-s", action = "store_true", help = "Use SAM masks if available")
-    parser.add_argument("--output", "-o", type=str, default=None, help="Output directory for plots (default: same as root_dir)")
+    parser.add_argument("--output", "-o", type=str, required = True, help="Output directory for plots")
     args = parser.parse_args()
 
     input_dirs, dir_metadata = [], []
-    for dir_path, _, _ in os.walk(args.root_dir):
+    for dir_path, _, _ in os.walk(args.dir_1):
         folder = dir_path.lower()
-        cond = args.cond_1 if args.cond_1 in folder else args.cond_2 if args.cond_2 in folder else None
-        if cond == None: # If neither condition is found, skip
-            continue
         if args.dir_substr.lower() in folder and "out" not in folder:
             if len([f for f in os.listdir(dir_path) if f[0].isdigit() and f.endswith((".tif", ".tiff"))]) == args.expected_channels:
-                print(f"Found dir: {dir_path} with condition: {cond}")
+                print(f"Found dir: {dir_path} with condition: {args.cond_1}")
                 input_dirs.append(dir_path)
-                dir_metadata.append({"dir": dir_path, "condition": cond})
+                dir_metadata.append({"dir": dir_path, "condition": args.cond_1})
+    
+    for dir_path, _, _ in os.walk(args.dir_2):
+        folder = dir_path.lower()
+        if args.dir_substr.lower() in folder and "out" not in folder:
+            if len([f for f in os.listdir(dir_path) if f[0].isdigit() and f.endswith((".tif", ".tiff"))]) == args.expected_channels:
+                print(f"Found dir: {dir_path} with condition: {args.cond_2}")
+                input_dirs.append(dir_path)
+                dir_metadata.append({"dir": dir_path, "condition": args.cond_2})
 
     print(f"Found {len(input_dirs)} valid directories.")
     stacks, valid_dirs, masks = load_hyperstacks_from_dirs(input_dirs, args.sam)
@@ -257,11 +263,9 @@ if __name__ == "__main__":
     # cmap = plt.get_cmap('tab10')  # or 'tab20', 'Set1', etc.
     # colors = np.array([cmap(i)[:3] for i in range(args.n_clusters)])
 
-    if args.output:
-        out_dir = args.output
-        os.makedirs(out_dir, exist_ok=True)
-    else:
-        out_dir = args.root_dir
+    out_dir = args.output
+    os.makedirs(out_dir, exist_ok=True)
+    
     # Use filtered spectra for spectra plots to match cluster_labels length
     plot_cluster_umap(embedding, cluster_labels, args.n_clusters, colors, out_dir)
     plot_cluster_spectra(combined_spectra, cluster_labels, args.n_clusters, wavenumbers, colors, out_dir)
