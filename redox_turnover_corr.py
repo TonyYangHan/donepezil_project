@@ -30,7 +30,7 @@ def process_folder(root, files, redox_list: list, protein_turn_list: list, lipid
         lipid_turn_list.append(lipid_turn_img)
 
 
-def img_correlation(A_list, B_list, order="K", dtype=np.float64, superpixel=None):
+def img_correlation(A_list, B_list, order="K", dtype=np.float64, superpixel=None, min_nonzero_prop: float = 0.5):
     if len(A_list) != len(B_list):
         raise ValueError("A_list and B_list must have the same length.")
     H, W = np.asarray(A_list[0]).shape
@@ -64,6 +64,7 @@ def img_correlation(A_list, B_list, order="K", dtype=np.float64, superpixel=None
     total_sp = len(A_list) * (Hc // s) * (Wc // s)
     x_list, y_list = [], []
     valid_sp = 0
+    dropped_sp = 0
 
     for Ai, Bi in zip(A_list, B_list):
         Ai = np.asarray(Ai, dtype=dtype)
@@ -76,12 +77,16 @@ def img_correlation(A_list, B_list, order="K", dtype=np.float64, superpixel=None
         Bblk = Bi.reshape(Hc//s, s, Wc//s, s)
         Am = np.median(Ablk, axis=(1,3))
         Bm = np.median(Bblk, axis=(1,3))
-        As = Ablk.sum(axis=(1,3))
-        Bs = Bblk.sum(axis=(1,3))
-        m = (As + Bs) != 0
-        xm = Am[m].ravel()
-        ym = Bm[m].ravel()
+        # Non-zero proportion filter (like -bnz)
+        nonzero_counts = (Ablk != 0).sum(axis=(1,3)) + (Bblk != 0).sum(axis=(1,3))
+        block_area = float(2 * s * s)  # counting both A and B contributions
+        nz_prop = nonzero_counts.astype(float) / block_area
+        # Keep blocks where combined proportion >= threshold
+        keep_blocks = nz_prop >= float(min_nonzero_prop)
+        xm = Am[keep_blocks].ravel()
+        ym = Bm[keep_blocks].ravel()
         valid_sp += xm.size
+        dropped_sp += (~keep_blocks).sum()
         x_list.append(xm)
         y_list.append(ym)
 
@@ -101,7 +106,7 @@ def img_correlation(A_list, B_list, order="K", dtype=np.float64, superpixel=None
 
 
     lr = linregress(xr, yr) if xr.size >= 2 else linregress([0,1], [0,1])
-    print(f"total superpixels: {total_sp}, valid superpixels: {valid_sp}, dropped: {total_sp - valid_sp}")
+    print(f"total superpixels: {total_sp}, valid superpixels: {valid_sp}, dropped by nz filter: {dropped_sp}")
     return lr, xr, yr
 
 def plot_hex_with_fit(x, y, a, b, r, gridsize=200, prefix = None, suffix=None, save_dir=None):
@@ -129,7 +134,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Calculate redox and unsaturation ratios from TIFF files.")
     parser.add_argument("path", type=str, help="condition 1 folder")
     parser.add_argument("--block-ttest", "-b", action="store_true", help="Run block-median t-test")
-    parser.add_argument("--block-size", type=int, default=16, help="Block size for block-median t-test (default: 16)")
+    parser.add_argument("--block-size", type=int, default=32, help="Block size for block-median correlation (default: 16)")
+    parser.add_argument("--block-min-nonzero", "-bnz", type=float, default=0.5, help="Minimum combined non-zero pixel proportion per block (default: 0.5)")
     parser.add_argument("-o", type=str, default=None, help="Directory to save plots")
     parser.add_argument("-p", type=str, default=None, help="Prefix for saved plots")
     args = parser.parse_args()
@@ -138,8 +144,8 @@ if __name__ == "__main__":
     for root, _, files in os.walk(args.path):
         process_folder(root, files, redox_list, protein_turn_list, lipid_turn_list)
     
-    lrp, xp, yp = img_correlation(redox_list, protein_turn_list, superpixel=args.block_size if args.block_ttest else None)
-    lrl, xl, yl = img_correlation(redox_list, lipid_turn_list, superpixel=args.block_size if args.block_ttest else None)
+    lrp, xp, yp = img_correlation(redox_list, protein_turn_list, superpixel=args.block_size if args.block_ttest else None, min_nonzero_prop=args.block_min_nonzero)
+    lrl, xl, yl = img_correlation(redox_list, lipid_turn_list, superpixel=args.block_size if args.block_ttest else None, min_nonzero_prop=args.block_min_nonzero)
 
     print(f"Corr. protein w/ redox: slope={lrp.slope:.4f}, intercept={lrp.intercept:.4f}, r={lrp.rvalue:.4f}, p={lrp.pvalue:.4e}")
     print(f"Corr. lipid w/ redox: slope={lrl.slope:.4f}, intercept={lrl.intercept:.4f}, r={lrl.rvalue:.4f}, p={lrl.pvalue:.4e}")

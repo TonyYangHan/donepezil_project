@@ -58,8 +58,31 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     else:
         raise ValueError("Suffix must be one of 'redox', 'unsat', 'protein_turn', or 'lipid_turn'.")
     
-    low, high = 0, 0.9
-    ratio[(ratio < low) | (ratio > high)] = 0
+    # Percentile-based bounds using positive (unmasked) values
+    valid = ratio > 0
+    if np.any(valid):
+        p_low, p_high = np.percentile(ratio[valid], (low_pct, high_pct))
+        # New clipping method: set to 0 if outside [p_low, p_high]
+        high_mask = ratio[valid] > p_high
+        low_mask = ratio[valid] < p_low
+        ratio_indices = np.where(valid)
+        # Apply masking
+        ratio[ratio_indices[0][high_mask], ratio_indices[1][high_mask]] = 0
+        ratio[ratio_indices[0][low_mask], ratio_indices[1][low_mask]] = 0
+    else:
+        p_low, p_high = 0.0, 0.0
+
+    # For lipid/protein turnover ratios, min-max scale to [0, 0.25]
+    if suffix in ["protein_turn", "lipid_turn"] and np.any(valid):
+        # Recompute valid after zeroing out-of-range values
+        valid = ratio > 0
+        if np.any(valid):
+            vmin, vmax = ratio[valid].min(), ratio[valid].max()
+            if vmax > vmin:
+                scaled = (ratio[valid] - vmin) / (vmax - vmin)
+                ratio[valid] = scaled * 0.25
+            else:
+                ratio[valid] = 0.0
 
 
     if save:
@@ -126,9 +149,10 @@ def run_test_image_mean(cond1_ratios, cond2_ratios, label="redox"):
     return t_stat, p_val
 
 
-def _block_medians_from_image(arr: np.ndarray, block_size: int) -> np.ndarray:
+def _block_medians_from_image(arr: np.ndarray, block_size: int, min_nonzero_prop: float = 0.5) -> np.ndarray:
     """Compute per-block medians for non-overlapping blocks.
-    Discard blocks whose sum is 0. Returns a 1D array of medians.
+    Discard blocks whose proportion of non-zero values is below threshold.
+    Returns a 1D array of medians.
     """
     if arr is None:
         raise ValueError("Input array is None.")
@@ -143,14 +167,22 @@ def _block_medians_from_image(arr: np.ndarray, block_size: int) -> np.ndarray:
     a = a[: bh * block_size, : bw * block_size]
     # reshape to (bh, block_size, bw, block_size)
     a4 = a.reshape(bh, block_size, bw, block_size)
-    # sums and medians per block
-    block_sums = a4.sum(axis=(1, 3))            # shape (bh, bw)
-    block_meds = np.median(a4, axis=(1, 3))     # shape (bh, bw)
-    mask = block_sums != 0
-    return block_meds[mask].ravel()
+    # Compute non-zero proportion per block first to avoid All-NaN warnings
+    block_area = float(block_size * block_size)
+    nonzero_counts = (a4 != 0).sum(axis=(1, 3))  # shape (bh, bw)
+    mask = (nonzero_counts.astype(float) / block_area) >= float(min_nonzero_prop)
+    if not np.any(mask):
+        return np.array([], dtype=float)
+    # Reorder axes to (bh, bw, block_size, block_size) to index by 2D mask
+    a4t = a4.transpose(0, 2, 1, 3)
+    kept_blocks = a4t[mask]  # shape: (K, block_size, block_size)
+    # Median over non-zero pixels only
+    kept_blocks_nz = np.where(kept_blocks == 0, np.nan, kept_blocks)
+    block_meds_kept = np.nanmedian(kept_blocks_nz, axis=(1, 2))  # shape (K,)
+    return block_meds_kept
 
 
-def run_block_median_ttest(cond1_ratios, cond2_ratios, block_size: int = 16, label: str = "redox"):
+def run_block_median_ttest(cond1_ratios, cond2_ratios, block_size: int = 16, label: str = "redox", min_nonzero_prop: float = 0.5):
     """Block-median t-test between two conditions.
 
     For each image, partition into non-overlapping block_size x block_size blocks,
@@ -167,11 +199,11 @@ def run_block_median_ttest(cond1_ratios, cond2_ratios, block_size: int = 16, lab
     for arr in cond1_ratios:
         if arr is None:
             continue
-        c1_vals.append(_block_medians_from_image(arr, bs))
+        c1_vals.append(_block_medians_from_image(arr, bs, min_nonzero_prop))
     for arr in cond2_ratios:
         if arr is None:
             continue
-        c2_vals.append(_block_medians_from_image(arr, bs))
+        c2_vals.append(_block_medians_from_image(arr, bs, min_nonzero_prop))
 
     c1 = np.concatenate(c1_vals) if len(c1_vals) else np.array([], dtype=float)
     c2 = np.concatenate(c2_vals) if len(c2_vals) else np.array([], dtype=float)
@@ -273,13 +305,14 @@ if __name__ == "__main__":
     parser.add_argument("--out", "-o", type=str, default=".", help="Root directory for saving outputs")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--block-ttest", "-b", action="store_true", help="Run block-median t-test")
-    parser.add_argument("--block-size", type=int, default=16, help="Block size for block-median t-test (default: 16)")
+    parser.add_argument("--block-size", "-bs", type=int, default=32, help="Block size for block-median t-test (default: 32)")
+    parser.add_argument("--block-min-nonzero", "-bnz", type=float, default=0.25, help="Minimum non-zero proportion per block to keep (default: 0.25)")
     args = parser.parse_args()
 
     save = args.save
     os.makedirs(args.out, exist_ok=True)
     cond1, cond2 = args.cond1, args.cond2
-    kwargs = {"low_pct": 0, "high_pct": 100, "gamma": 1.0, "cbar": 'turbo', "use_mask": False}
+    kwargs = {"low_pct": 1, "high_pct": 99, "gamma": 1.0, "cbar": 'turbo', "use_mask": False}
     
     # Collect ratios
     cond1_redox, cond2_redox, cond1_unsat, cond2_unsat = [], [], [], []
@@ -317,9 +350,9 @@ if __name__ == "__main__":
 
     if args.block_ttest:
         print("Running block-median t-tests...")
-        _, p_val_redox, _, _ = run_block_median_ttest(cond1_redox, cond2_redox, block_size=args.block_size, label="redox")
+        _, p_val_redox, _, _ = run_block_median_ttest(cond1_redox, cond2_redox, block_size=args.block_size, label="redox", min_nonzero_prop=args.block_min_nonzero)
         print()
-        _, p_val_unsat, _, _ = run_block_median_ttest(cond1_unsat, cond2_unsat, block_size=args.block_size, label="unsat")
+        _, p_val_unsat, _, _ = run_block_median_ttest(cond1_unsat, cond2_unsat, block_size=args.block_size, label="unsat", min_nonzero_prop=args.block_min_nonzero)
         print()
 
         plot_violins_with_stats(cond1_redox, cond2_redox, cond1=cond1, cond2=cond2,
@@ -328,9 +361,9 @@ if __name__ == "__main__":
                                 label="unsat", outdir=args.out, p_val=p_val_unsat, test_name="Block-median t-test")
 
         if args.d:
-            _, p_val_pt, _, _ = run_block_median_ttest(cond1_turn_protein, cond2_turn_protein, block_size=args.block_size, label="protein_turn")
+            _, p_val_pt, _, _ = run_block_median_ttest(cond1_turn_protein, cond2_turn_protein, block_size=args.block_size, label="protein_turn", min_nonzero_prop=args.block_min_nonzero)
             print()
-            _, p_val_lt, _, _ = run_block_median_ttest(cond1_turn_lipid, cond2_turn_lipid, block_size=args.block_size, label="lipid_turn")
+            _, p_val_lt, _, _ = run_block_median_ttest(cond1_turn_lipid, cond2_turn_lipid, block_size=args.block_size, label="lipid_turn", min_nonzero_prop=args.block_min_nonzero)
             print()
 
             plot_violins_with_stats(cond1_turn_protein, cond2_turn_protein, cond1=cond1, cond2=cond2,
