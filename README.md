@@ -4,9 +4,7 @@ Analyze metabolic and lipidomic changes in aging fruit flies (wild type) under d
 
 ## Environment and Installation
 
-Conda is recommended.
-
-Windows PowerShell (recommended):
+Linux and conda environment is recommended for maximum reproducibility.
 
 ```
 conda env create -f hsi_analysis.yml -n hsi_analysis
@@ -58,7 +56,7 @@ Outputs
 
 ### 2) Lipid Droplet Segmentation and Stats (Accelerated): `lipid_analysis_accl.py`
 Purpose
-- Segment lipid droplets (threshold + size filtering), then compare droplet size distributions, pairwise centroid distances, and counts across two conditions. Default segmentation parameters are the best for this particular project. They could be specified easily by command line args. Uses parallel processing for speed and saves bar/violin plots with statistics.
+- Segment lipid droplets (threshold + size filtering), then compare droplet size distributions, pairwise centroid distances (a measure for droplet density), and counts across two conditions. Default segmentation parameters are the best for this particular project. They could be specified easily by command line args. Uses parallel processing for speed and saves bar/violin plots with statistics.
 
 Key arguments (subset)
 - `dir_1 dir_2 cond_1 cond_2`: Folders and labels for two conditions.
@@ -80,7 +78,7 @@ Outputs
 
 ### 3) Redox vs. Turnover Correlation: `redox_turnover_corr.py`
 Purpose
-- Correlate per-pixel or superpixel values between precomputed `redox_ratio` images and `protein_turn`/`lipid_turn` images with matching ROI numbers. Produces hexbin plots with linear fit and correlation metrics.
+- Correlate per-pixel or superpixel values between precomputed `redox_ratio` images and `protein_turn` (protein turnover rate)/`lipid_turn` (lipid turnover rate) images with matching ROI numbers. Produces hexbin plots with linear fit and correlation metrics. This aims to reveal the correlation between redox activity with protein/lipid synthesis activity.
 
 Key arguments (subset)
 - `path`: Root folder searched recursively for files.
@@ -101,7 +99,7 @@ Outputs
 
 ### 4) HSI Unsupervised Clustering (GPU): `hsi_unsup_kmeans_v2_gp_combined.py`
 Purpose
-- Combined analysis across one or more HSI directories: preprocess spectra (water baseline removal, normalization), GPU-UMAP embedding, GPU-KMeans clustering, cluster composition, UMAP/spectra plots, and per-directory cluster maps.
+- Combined analysis across one or more HSI directories: preprocess spectra (water baseline removal, normalization), GPU-UMAP embedding, GPU-KMeans clustering, cluster composition, UMAP/spectra plots, and per-directory cluster maps. Since different mixture of molecules gives different Raman spectra, clustering different spectra reveals metabolic zonation and heterogeneity in different tissue regions.
 
 Key arguments (subset)
 - `baseline_path`: Path to water baseline CSV (e.g., `water_HSI_76.csv`).
@@ -123,7 +121,7 @@ Outputs
 - UMAP plot, cluster spectra, per-image cluster maps, and cluster composition plots saved under the output directory.
 
 ### 5) Notebooks
-- `Masks_operations.ipynb`: Interactive utilities to segment lipid droplets, generate overlays on raw images, and build simple ratios/overlays for PRM/SRS outputs. Open in Jupyter/VS Code and run cells in order. Outputs include overlay images and example ratio `.tiff` files.
+- `Masks_operations.ipynb`: Interactive utilities to segment lipid droplets, generate overlays on raw images, and build simple ratios/overlays for PRM/SRS outputs. Open in Jupyter/VS Code and run cells in order. Outputs include overlay images and example ratio `.tiff` files. This is for interactive pipeline prototyping.
 
 ### 6) Helper Shell Scripts
 - `run_ratio_all_v2.sh`, `run_lipid_all.sh`, `run_corr_all.sh`: Convenience wrappers to batch-run the above Python scripts.
