@@ -2,7 +2,7 @@ import os, numpy as np, pandas as pd, cv2, argparse, matplotlib.pyplot as plt
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm.auto import tqdm
 from skimage import measure
-from calculate_ratios_gp_v2 import get_number
+from calculate_ratios_gp import get_number
 from scipy.stats import ttest_ind, mannwhitneyu
 from scipy.spatial.distance import pdist
 

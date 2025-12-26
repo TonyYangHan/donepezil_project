@@ -1,49 +1,63 @@
 import os, numpy as np, cv2, argparse, tifffile as tiff
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt, matplotlib.colors as mcolors
-import re
+import itertools
 from scipy.stats import ttest_ind, mannwhitneyu
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import torch
+from matplotlib.backends.backend_pdf import PdfPages
+from utils import get_number, match_files, generate_model_masks
+from visualizations import save_ratio_image, plot_bars_all, plot_violins_all
 
-
-
-def save_ratio_image(ratio, root_path, filename, low_pct = 2, high_pct = 98, gamma = 1.0, cbar = 'turbo'):
-    p_low, p_high = np.percentile(ratio[ratio > 0], (low_pct, high_pct))
-    norm = mcolors.PowerNorm(gamma=gamma, vmin=p_low, vmax=p_high, clip=True)
-    plt.figure(figsize=(6, 6))
-    plt.imshow(ratio, cmap=cbar, norm=norm)
-    cb = plt.colorbar(label='Ratio')
-    cb.set_ticks([p_low, (p_low + p_high) / 2, p_high])
-    plt.title(f'Ratio ({low_pct}-{high_pct}th percent)')
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig(os.path.join(root_path, filename), dpi=300)
-    plt.close()
-
-
+# Default parameters (no external config)
+BLOCK_SIZE = 32
+BLOCK_MIN_NONZERO = 0.25
+HIDE_NON_SIGNIFICANT = False
+GAMMA_DEFAULT = 1.0
+CBAR_DEFAULT = "turbo"
+USE_MASK_DEFAULT = False
+LOW_PCT_DEFAULT = 1.0
+HIGH_PCT_DEFAULT = 99.0
+LOWER_THRESH_DEFAULT = 0.0
 
 def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
-                    **kwargs):
+                    mask_map=None, **kwargs):
     
     low_pct = kwargs.get("low_pct", 2)
     high_pct = kwargs.get("high_pct", 98)
     gamma = kwargs.get("gamma", 1.0)
     cbar = kwargs.get("cbar", 'turbo')
     use_mask = kwargs.get("use_mask", True)
+    filter_mode = kwargs.get("filter_mode", "percentile")
+    sigma_k = float(kwargs.get("sigma_k", 3.0))
+    turnover_min = float(kwargs.get("turnover_min", 0.01))
+    lower_thresh = float(kwargs.get("lower_thresh", 0.0))
     
     fad = cv2.imread(os.path.join(root_path, fad_path), cv2.IMREAD_UNCHANGED)
     nadh = cv2.imread(os.path.join(root_path, nadh_path), cv2.IMREAD_UNCHANGED)
-    fad = np.where(fad == 4095, 0, fad)  # Remove saturated pixels
-    nadh = np.where(nadh == 4095, 0, nadh)  # Remove saturated pixels
 
     sat_mask = (fad == 4095) | (nadh == 4095)  # union of saturated pixels
     fad[sat_mask] = 0
     nadh[sat_mask] = 0
 
+    if lower_thresh > 0:
+        fad[fad < lower_thresh] = 0
+        nadh[nadh < lower_thresh] = 0
+
+    roi_id = get_number(fad_path)
+    if mask_map is not None and roi_id in mask_map:
+        roi_mask = mask_map[roi_id]
+        if roi_mask.shape != fad.shape:
+            roi_mask = cv2.resize(roi_mask, (fad.shape[1], fad.shape[0]), interpolation=cv2.INTER_NEAREST)
+        fad = (fad.astype(np.float32) * roi_mask).astype(fad.dtype)
+        nadh = (nadh.astype(np.float32) * roi_mask).astype(nadh.dtype)
+
     mask8 = np.ones_like(fad, dtype=np.float32)
     if use_mask:
-        fad8 = cv2.convertScaleAbs(fad, alpha=255.0 / float(fad.max()))
-        _, mask8 = cv2.threshold(fad8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        max_val = float(fad.max())
+        if max_val > 0:
+            fad8 = cv2.convertScaleAbs(fad, alpha=255.0 / max_val)
+            _, mask8 = cv2.threshold(fad8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            mask8.fill(0)
     
     f = fad.astype(np.float32)
     n = nadh.astype(np.float32)
@@ -58,17 +72,26 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     else:
         raise ValueError("Suffix must be one of 'redox', 'unsat', 'protein_turn', or 'lipid_turn'.")
     
-    # Percentile-based bounds using positive (unmasked) values
+    # Filtering using either percentile bounds or sigma-based filtering (exclusive)
     valid = ratio > 0
     if np.any(valid):
-        p_low, p_high = np.percentile(ratio[valid], (low_pct, high_pct))
-        # New clipping method: set to 0 if outside [p_low, p_high]
-        high_mask = ratio[valid] > p_high
-        low_mask = ratio[valid] < p_low
-        ratio_indices = np.where(valid)
-        # Apply masking
-        ratio[ratio_indices[0][high_mask], ratio_indices[1][high_mask]] = 0
-        ratio[ratio_indices[0][low_mask], ratio_indices[1][low_mask]] = 0
+        if str(filter_mode).lower() == "sigma":
+            vals = ratio[valid]
+            mu = float(np.mean(vals))
+            sd = float(np.std(vals))
+            lower = mu - sigma_k * sd
+            upper = mu + sigma_k * sd
+            mask_keep = (ratio >= lower) & (ratio <= upper) & valid
+            ratio[~mask_keep] = 0
+            p_low, p_high = lower, upper
+        else:
+            p_low, p_high = np.percentile(ratio[valid], (low_pct, high_pct))
+            # Set to 0 if outside [p_low, p_high]
+            high_mask = ratio[valid] > p_high
+            low_mask = ratio[valid] < p_low
+            ratio_indices = np.where(valid)
+            ratio[ratio_indices[0][high_mask], ratio_indices[1][high_mask]] = 0
+            ratio[ratio_indices[0][low_mask], ratio_indices[1][low_mask]] = 0
     else:
         p_low, p_high = 0.0, 0.0
 
@@ -83,6 +106,11 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
                 ratio[valid] = scaled * 0.25
             else:
                 ratio[valid] = 0.0
+        # After scaling, drop very small turnover values below threshold
+        if turnover_min > 0:
+            mask_small = (ratio > 0) & (ratio < float(turnover_min))
+            if np.any(mask_small):
+                ratio[mask_small] = 0.0
 
 
     if save:
@@ -92,61 +120,63 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     return ratio
 
 
-
-def get_number(filename):
-    match = re.search(r'(\d+)', filename)
-    return match.group(1) if match else None
-
-def match_files(files, label):
-    return {get_number(f): f for f in files if label in f and (f.endswith('.tiff') or f.endswith('.tif'))}
-
-
-
-def process_group(root, files, redox_list, unsat_list, protein_turn_list, lipid_turn_list, save=False, **kwargs):
+def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnover=False,
+                     save=False, workers=1, mask_map=None, **kwargs):
+    files = os.listdir(root)
     fad_dict = match_files(files, "fad")
     nadh_dict = match_files(files, "nadh")
     unsat_dict = match_files(files, "787")
     sat_dict = match_files(files, "794")
+    d_pro_dict = match_files(files, "841")
+    d_lip_dict = match_files(files, "844")
+    pro_dict = match_files(files, "791")
+    lip_dict = match_files(files, "797")
 
-    # Redox ratios
-    for num in fad_dict:
-        redox_list.append(calculate_ratio(root, fad_dict[num], nadh_dict[num], "redox", save, **kwargs))
-    # Unsat ratios
-    for num in unsat_dict:
-        unsat_list.append(calculate_ratio(root, unsat_dict[num], sat_dict[num], "unsat", save, **kwargs))
+    data = {
+        "redox": [] if enable_redox else None,
+        "unsat": [] if enable_unsat else None,
+        "protein_turn": [] if enable_turnover else None,
+        "lipid_turn": [] if enable_turnover else None,
+    }
 
-    if protein_turn_list is not None and lipid_turn_list is not None:
-        d_pro_dict = match_files(files, "841")
-        d_lip_dict = match_files(files, "844")
-        pro_dict = match_files(files, "791")
-        lip_dict = match_files(files, "797")
+    tasks = []
+    if enable_redox:
+        for num, fad_path in sorted(fad_dict.items()):
+            nadh_path = nadh_dict.get(num)
+            if nadh_path:
+                tasks.append(("redox", fad_path, nadh_path))
 
-        for num in d_pro_dict:
-            protein_turn_list.append(calculate_ratio(root, d_pro_dict[num], pro_dict[num], "protein_turn", save, **kwargs))
-        for num in d_lip_dict:
-            lipid_turn_list.append(calculate_ratio(root, d_lip_dict[num], lip_dict[num], "lipid_turn", save, **kwargs))
+    if enable_unsat:
+        for num, unsat_path in sorted(unsat_dict.items()):
+            sat_path = sat_dict.get(num)
+            if sat_path:
+                tasks.append(("unsat", unsat_path, sat_path))
 
+    if enable_turnover:
+        for num, d_pro_path in sorted(d_pro_dict.items()):
+            pro_path = pro_dict.get(num)
+            if pro_path:
+                tasks.append(("protein_turn", d_pro_path, pro_path))
+        for num, d_lip_path in sorted(d_lip_dict.items()):
+            lip_path = lip_dict.get(num)
+            if lip_path:
+                tasks.append(("lipid_turn", d_lip_path, lip_path))
 
+    max_workers = max(1, int(workers) if workers is not None else 1)
+    if max_workers > 1 and tasks:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {
+                ex.submit(calculate_ratio, root, path_a, path_b, suffix, save, mask_map=mask_map, **kwargs): suffix
+                for suffix, path_a, path_b in tasks
+            }
+            for fut in as_completed(future_map):
+                suffix = future_map[fut]
+                data[suffix].append(fut.result())
+    else:
+        for suffix, path_a, path_b in tasks:
+            data[suffix].append(calculate_ratio(root, path_a, path_b, suffix, save, mask_map=mask_map, **kwargs))
 
-def flatten_and_filter(ratio_list):
-    # Flatten list of arrays and exclude zeros
-    return np.concatenate([r.ravel() for r in ratio_list if r is not None])
-
-
-
-def run_test_image_mean(cond1_ratios, cond2_ratios, label="redox"):
-
-    cond1_means = [np.mean(r) for r in cond1_ratios if r is not None]
-    cond2_means = [np.mean(r) for r in cond2_ratios if r is not None]
-
-    t_stat, p_val = ttest_ind(cond1_means, cond2_means, equal_var=False)
-    u_stat, p_val_mw = mannwhitneyu(cond1_means, cond2_means)
-
-    print(f"Student's t-test for {label} (mean pixel values): t={t_stat:.4f}, p={p_val}")
-    print()
-    print(f"Mann-Whitney U test for {label} (mean pixel values): U={u_stat:.4f}, p={p_val_mw}")
-
-    return t_stat, p_val
+    return data
 
 
 def _block_medians_from_image(arr: np.ndarray, block_size: int, min_nonzero_prop: float = 0.5) -> np.ndarray:
@@ -182,31 +212,19 @@ def _block_medians_from_image(arr: np.ndarray, block_size: int, min_nonzero_prop
     return block_meds_kept
 
 
-def run_block_median_ttest(cond1_ratios, cond2_ratios, block_size: int = 16, label: str = "redox", min_nonzero_prop: float = 0.5):
-    """Block-median t-test between two conditions.
+def run_block_median_ttest(cond1_block_vals, cond2_block_vals, label: str = "redox"):
+    """Welch's t-test on precomputed block-median arrays for two conditions.
 
-    For each image, partition into non-overlapping block_size x block_size blocks,
-    discard blocks whose sum is 0, and use the median within each block as its value.
-    Concatenate all valid block medians per condition and run Welch's t-test.
-
+    Inputs are 1D arrays (or array-like) of block medians for each condition.
     Returns (t_stat, p_val, n_blocks_cond1, n_blocks_cond2). If insufficient data,
     returns (None, None, 0, 0).
     """
-    bs = int(block_size)
-    c1_vals = []
-    c2_vals = []
+    c1 = np.asarray(cond1_block_vals, dtype=float).ravel()
+    c2 = np.asarray(cond2_block_vals, dtype=float).ravel()
 
-    for arr in cond1_ratios:
-        if arr is None:
-            continue
-        c1_vals.append(_block_medians_from_image(arr, bs, min_nonzero_prop))
-    for arr in cond2_ratios:
-        if arr is None:
-            continue
-        c2_vals.append(_block_medians_from_image(arr, bs, min_nonzero_prop))
-
-    c1 = np.concatenate(c1_vals) if len(c1_vals) else np.array([], dtype=float)
-    c2 = np.concatenate(c2_vals) if len(c2_vals) else np.array([], dtype=float)
+    # Drop NaNs just in case
+    c1 = c1[np.isfinite(c1)]
+    c2 = c2[np.isfinite(c2)]
 
     n1, n2 = c1.size, c2.size
     if n1 == 0 or n2 == 0:
@@ -215,173 +233,162 @@ def run_block_median_ttest(cond1_ratios, cond2_ratios, block_size: int = 16, lab
 
     t_stat, p_val = ttest_ind(c1, c2, equal_var=False)
     u_stat, p_val_mw = mannwhitneyu(c1, c2)
-    print(f"Block-median t-test for {label} (block {bs}x{bs}): t={t_stat:.4f}, p={p_val} | n1={n1}, n2={n2}")
-    print(f"Block-median Mann-Whitney U test for {label} (block {bs}x{bs}): U={u_stat:.4f}, p={p_val_mw}")
+    print(f"Block-median t-test for {label}: t={t_stat:.4f}, p={p_val} | n1={n1}, n2={n2}")
+    print(f"Block-median Mann-Whitney U test for {label}: U={u_stat:.4f}, p={p_val_mw}")
     return t_stat, p_val, n1, n2
 
 
-
-def plot_histograms(cond1_ratios, cond2_ratios, 
-                    cond1 = "cond1", cond2 = "cond2", label="redox", bins=100, outdir="."):
-    cond1_vals = flatten_and_filter(cond1_ratios)
-    cond2_vals = flatten_and_filter(cond2_ratios)
-    cond1_vals = cond1_vals[cond1_vals != 0]
-    cond2_vals = cond2_vals[cond2_vals != 0]
-    plt.figure(figsize=(8, 5))
-    plt.hist(cond1_vals, bins=bins, alpha=0.6, label=cond1, color="tab:blue", density=True)
-    plt.hist(cond2_vals, bins=bins, alpha=0.6, label=cond2, color="tab:orange", density=True)
-    plt.xlabel(f"{label.capitalize()} ratio")
-    plt.ylabel("Density")
-    plt.title(f"Distribution of {label} ratios: {cond1} vs {cond2}")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"{label}_{cond1}_vs_{cond2}_hist.png"), dpi = 300)
-    plt.close()
+def collect_block_medians(cond_ratios, block_size: int = 32, min_nonzero_prop: float = 0.5) -> np.ndarray:
+    vals = []
+    for arr in cond_ratios:
+        if arr is None:
+            continue
+        vals.append(_block_medians_from_image(arr, int(block_size), float(min_nonzero_prop)))
+    if len(vals) == 0:
+        return np.array([], dtype=float)
+    return np.concatenate(vals) if len(vals) else np.array([], dtype=float)
 
 
-
-def plot_violins_with_stats(cond1_ratios, cond2_ratios, 
-                            cond1="cond1", cond2="cond2", label="redox", outdir=".", p_val=None, test_name=""):
-    cond1_vals = flatten_and_filter(cond1_ratios)
-    cond2_vals = flatten_and_filter(cond2_ratios)
-    cond1_vals = cond1_vals[cond1_vals != 0]
-    cond2_vals = cond2_vals[cond2_vals != 0]
-    data = [cond1_vals, cond2_vals]
-
-    plt.figure(figsize=(6, 10))
-    plt.violinplot(data, showmeans=True, showmedians=True)
-    plt.xticks([1, 2], [cond1, cond2])
-    plt.ylabel(f"{label.capitalize()} ratio")
-    plt.title(f"Violin plot of {label} ratios: {cond1} vs {cond2}")
-
-    # Add connecting bar and asterisk(s) for significance
-    y_max = max(np.max(cond1_vals), np.max(cond2_vals))
-    y_min = min(np.min(cond1_vals), np.min(cond2_vals))
-    y_range = y_max - y_min
-    y_bar = y_max + 0.01 * y_range  # Move bar closer to data
-
-    plt.plot([1, 2], [y_bar, y_bar], color='black', linewidth=1.5)
-
-    # Determine significance stars
-    if p_val is not None:
-        if p_val < 0.001:
-            sig = "***"
-        elif p_val < 0.01:
-            sig = "**"
-        elif p_val < 0.05:
-            sig = "*"
+def pairwise_tests(metric_values):
+    results = {}
+    conds = list(metric_values.keys())
+    for c1, c2 in itertools.combinations(conds, 2):
+        v1 = np.asarray(metric_values[c1])
+        v2 = np.asarray(metric_values[c2])
+        if v1.size == 0 or v2.size == 0:
+            p_t, p_u = np.nan, np.nan
         else:
-            sig = "n.s."
-    else:
-        sig = "n.s."
+            _, p_t = ttest_ind(v1, v2, equal_var=False)
+            _, p_u = mannwhitneyu(v1, v2)
+        results[(c1, c2)] = (p_t, p_u)
+    return results
 
-    plt.text(1.5, y_bar + 0.01 * y_range, sig,
-             ha='center', va='bottom', fontsize=18, fontweight='bold')
 
-    # Optionally add p-value annotation, closer to the bar
-    if p_val is not None:
-        plt.text(1.5, y_bar + 0.03 * y_range,
-                 f"{test_name} p={p_val:.2e}", ha='center', va='bottom', fontsize=15)
-
-    # Leave some room below the lowest data point
-    plt.ylim(y_min - 0.07 * y_range, y_bar + 0.07 * y_range)
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"{label}_{cond1}_vs_{cond2}_violin_stats_{test_name}.png"), dpi=300)
-    plt.close()
+def print_pairwise(results, label):
+    print(f"\nPairwise stats for {label}:")
+    for (c1, c2), (p_t, p_u) in results.items():
+        t_txt = f"{p_t:.4e}" if p_t is not None and not np.isnan(p_t) else "nan"
+        u_txt = f"{p_u:.4e}" if p_u is not None and not np.isnan(p_u) else "nan"
+        print(f"{c1} vs {c2} -> t p={t_txt}, U p={u_txt}")
 
 
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(description="Calculate redox and unsaturation ratios from TIFF files.")
-    parser.add_argument("dir_1", type=str, help="condition 1 folder")
-    parser.add_argument("dir_2", type=str, help="condition 2 folder")
-    parser.add_argument("-d", action="store_true", help="Deuterated samples")
-    parser.add_argument("--cond1", type=str, default="cond1", help="Label for condition 1")
-    parser.add_argument("--cond2", type=str, default="cond2", help="Label for condition 2")
-    parser.add_argument("--mean", "-m", action="store_true", help="Run t-test on image means")
-    parser.add_argument("--save", "-s", action="store_true", help="Save ratio images")
-    parser.add_argument("--plot", "-p", help="Plot histograms", action="store_true")
-    parser.add_argument("--out", "-o", type=str, default=".", help="Root directory for saving outputs")
-    parser.add_argument("--verbose", action="store_true", help="Verbose output")
-    parser.add_argument("--block-ttest", "-b", action="store_true", help="Run block-median t-test")
-    parser.add_argument("--block-size", "-bs", type=int, default=32, help="Block size for block-median t-test (default: 32)")
-    parser.add_argument("--block-min-nonzero", "-bnz", type=float, default=0.25, help="Minimum non-zero proportion per block to keep (default: 0.25)")
+    parser = argparse.ArgumentParser(description="Calculate ratios across multiple conditions and plot group comparisons.")
+    parser.add_argument("dirs", nargs="+", type=str, help="Input directories for each condition")
+    parser.add_argument("--conds", "-c", nargs="+", required=True, help="Condition names (match order of dirs)")
+    parser.add_argument("--out", "-o", type=str, default=".", help="Output directory for plots")
+    parser.add_argument("-d", "--deuterated", action="store_true", help="Include deuterated turnover channels")
+    parser.add_argument("--save", "-s", action="store_true", help="Save per-image ratio maps")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("-r", "--skip-redox", action="store_true", help="Skip redox analysis")
+    parser.add_argument("-u", "--skip-unsat", action="store_true", help="Skip unsaturation analysis")
+    parser.add_argument("--workers", "-w", type=int, default=(os.cpu_count() or 1), help="Number of parallel workers (default: os.cpu_count())")
+    parser.add_argument("--use-model-mask", action="store_true", help="Apply model-generated ROI masks from 791-channel images before segmentation")
+    parser.add_argument("--mask-weights", type=str, default=None, help="Path to the MultiScaleUNet mask weights (.pth)")
+    parser.add_argument("--mask-threshold", type=float, default=0.5, help="Sigmoid threshold for binarizing the predicted mask")
+    parser.add_argument("--lower-thresh", "-lt", type=float, default=0.0, help="Zero out raw pixels below this value before ratio calculation")
+    parser.add_argument("--pdf-out", "-p", type=str, default=None, help="Optional path to save all plots into a single multi-page PDF")
+    # Filtering controls
+    parser.add_argument("--filter-mode", "-f", choices=["percentile", "sigma"], default="percentile",
+                        help="Filtering mode for ratios: 'percentile' zeros values outside [low, high] percentiles; 'sigma' zeros values beyond mean±k*std.")
+    parser.add_argument("--low-pct", "-lp", type=float, default=1.0, help="Low percentile for percentile filtering")
+    parser.add_argument("--high-pct", "-hp", type=float, default=99.0, help="High percentile for percentile filtering")
+    parser.add_argument("--sigma-k", "-sk", type=float, default=3.0, help="K standard deviations for sigma filtering")
+    parser.add_argument("--turnover-min", "-tmin", type=float, default=0.01,
+                        help="For turnover ratios, zero values below this threshold after scaling")
     args = parser.parse_args()
+
+    if len(args.dirs) != len(args.conds):
+        raise ValueError("dirs and conds must have the same length")
 
     save = args.save
     os.makedirs(args.out, exist_ok=True)
-    cond1, cond2 = args.cond1, args.cond2
-    kwargs = {"low_pct": 1, "high_pct": 99, "gamma": 1.0, "cbar": 'turbo', "use_mask": False}
-    
-    # Collect ratios
-    cond1_redox, cond2_redox, cond1_unsat, cond2_unsat = [], [], [], []
-    if args.d:
-        cond1_turn_protein, cond2_turn_protein, cond1_turn_lipid, cond2_turn_lipid = [], [], [], []
-    else:
-        cond1_turn_protein, cond2_turn_protein, cond1_turn_lipid, cond2_turn_lipid = None, None, None, None
-    dir1_files = os.listdir(args.dir_1)
-    dir2_files = os.listdir(args.dir_2)
-    process_group(args.dir_1, dir1_files, cond1_redox, cond1_unsat, cond1_turn_protein, cond1_turn_lipid,
-                  save, **kwargs)
-    process_group(args.dir_2, dir2_files, cond2_redox, cond2_unsat, cond2_turn_protein, cond2_turn_lipid,
-                  save, **kwargs)
+    pdf_pages = PdfPages(args.pdf_out) if args.pdf_out else None
+    kwargs = {
+        "low_pct": float(args.low_pct),
+        "high_pct": float(args.high_pct),
+        "gamma": GAMMA_DEFAULT,
+        "cbar": CBAR_DEFAULT,
+        "use_mask": USE_MASK_DEFAULT,
+        "filter_mode": args.filter_mode,
+        "sigma_k": float(args.sigma_k),
+        "turnover_min": float(args.turnover_min),
+        "lower_thresh": float(args.lower_thresh),
+    }
+
+    # Collect ratios per condition
+    enable_redox = not args.skip_redox
+    enable_unsat = not args.skip_unsat
+
+    cond_redox = {cond: [] for cond in args.conds} if enable_redox else None
+    cond_unsat = {cond: [] for cond in args.conds} if enable_unsat else None
+    cond_turn_protein = {cond: [] for cond in args.conds} if args.deuterated else None
+    cond_turn_lipid = {cond: [] for cond in args.conds} if args.deuterated else None
+
+    for cond, dir_path in zip(args.conds, args.dirs):
+        if not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"Directory not found: {dir_path}")
+        mask_map = None
+        if args.use_model_mask:
+            if not args.mask_weights:
+                raise ValueError("Mask weights must be provided when --use-model-mask is set.")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            mask_map = generate_model_masks(dir_path, args.mask_weights, device=device, threshold=args.mask_threshold)
+        data = process_condition(dir_path, enable_redox=enable_redox, enable_unsat=enable_unsat,
+                     enable_turnover=args.deuterated, save=save, workers=args.workers, mask_map=mask_map, **kwargs)
+        if cond_redox is not None:
+            cond_redox[cond] = data.get("redox", [])
+        if cond_unsat is not None:
+            cond_unsat[cond] = data.get("unsat", [])
+        if cond_turn_protein is not None:
+            cond_turn_protein[cond] = data.get("protein_turn", [])
+        if cond_turn_lipid is not None:
+            cond_turn_lipid[cond] = data.get("lipid_turn", [])
+
+        if args.verbose:
+            print(f"Processed {cond}: {len(data.get('redox') or [])} redox, {len(data.get('unsat') or [])} unsat, "
+                  f"{len(data.get('protein_turn') or [])} protein turn, {len(data.get('lipid_turn') or [])} lipid turn")
+
     print("Processing complete.")
 
-    if args.verbose:
-        print(f"Found {len(cond1_redox)} cond1 redox images and {len(cond2_redox)} cond2 redox images.")
-        print(f"Found {len(cond1_unsat)} cond1 unsat images and {len(cond2_unsat)} cond2 unsat images.")
-        print(f"Found {len(cond1_turn_protein) if cond1_turn_protein else 0} cond1 protein images and {len(cond2_turn_protein) if cond2_turn_protein else 0} cond2 protein images.")
-        print(f"Found {len(cond1_turn_lipid) if cond1_turn_lipid else 0} cond1 lipid images and {len(cond2_turn_lipid) if cond2_turn_lipid else 0} cond2 lipid images.")
+    print("Running block-median tests and plotting group comparisons...")
 
-    if args.mean:
-        print("Running t-tests on image means...")
+    def block_map(metric_map):
+        return {cond: collect_block_medians(ratios, block_size=BLOCK_SIZE, min_nonzero_prop=BLOCK_MIN_NONZERO)
+                for cond, ratios in metric_map.items()}
 
-        run_test_image_mean(cond1_redox, cond2_redox, label="redox")
-        print()
-        run_test_image_mean(cond1_unsat, cond2_unsat, label="unsat")
-        print()
+    if cond_redox is not None:
+        redox_blocks = block_map(cond_redox)
+        redox_pairwise = pairwise_tests(redox_blocks)
+        print_pairwise(redox_pairwise, "redox (block medians)")
+        redox_p = {k: v[0] for k, v in redox_pairwise.items()}
+        plot_violins_all(redox_blocks, args.conds, redox_p, args.out, "Block-median t-test", "Redox ratio", "redox", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_bars_all(redox_blocks, args.conds, redox_p, args.out, "Block-median t-test", "Redox ratio", "redox", HIDE_NON_SIGNIFICANT, pdf_pages)
 
-        if args.d:
-            run_test_image_mean(cond1_turn_protein, cond2_turn_protein, label="protein_turn")
-            print()
-            run_test_image_mean(cond1_turn_lipid, cond2_turn_lipid, label="lipid_turn")
-            print()
+    if cond_unsat is not None:
+        unsat_blocks = block_map(cond_unsat)
+        unsat_pairwise = pairwise_tests(unsat_blocks)
+        print_pairwise(unsat_pairwise, "unsaturation (block medians)")
+        unsat_p = {k: v[0] for k, v in unsat_pairwise.items()}
+        plot_violins_all(unsat_blocks, args.conds, unsat_p, args.out, "Block-median t-test", "Unsaturation ratio", "unsat", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_bars_all(unsat_blocks, args.conds, unsat_p, args.out, "Block-median t-test", "Unsaturation ratio", "unsat", HIDE_NON_SIGNIFICANT, pdf_pages)
 
-    if args.block_ttest:
-        print("Running block-median t-tests...")
-        _, p_val_redox, _, _ = run_block_median_ttest(cond1_redox, cond2_redox, block_size=args.block_size, label="redox", min_nonzero_prop=args.block_min_nonzero)
-        print()
-        _, p_val_unsat, _, _ = run_block_median_ttest(cond1_unsat, cond2_unsat, block_size=args.block_size, label="unsat", min_nonzero_prop=args.block_min_nonzero)
-        print()
+    if args.deuterated:
+        pt_blocks = block_map(cond_turn_protein)
+        lt_blocks = block_map(cond_turn_lipid)
+        pt_pairwise = pairwise_tests(pt_blocks)
+        lt_pairwise = pairwise_tests(lt_blocks)
+        print_pairwise(pt_pairwise, "protein turnover (block medians)")
+        print_pairwise(lt_pairwise, "lipid turnover (block medians)")
+        pt_p = {k: v[0] for k, v in pt_pairwise.items()}
+        lt_p = {k: v[0] for k, v in lt_pairwise.items()}
+        plot_violins_all(pt_blocks, args.conds, pt_p, args.out, "Block-median t-test", "Protein turnover ratio", "protein_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_bars_all(pt_blocks, args.conds, pt_p, args.out, "Block-median t-test", "Protein turnover ratio", "protein_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_violins_all(lt_blocks, args.conds, lt_p, args.out, "Block-median t-test", "Lipid turnover ratio", "lipid_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_bars_all(lt_blocks, args.conds, lt_p, args.out, "Block-median t-test", "Lipid turnover ratio", "lipid_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
 
-        plot_violins_with_stats(cond1_redox, cond2_redox, cond1=cond1, cond2=cond2,
-                                label="redox", outdir=args.out, p_val=p_val_redox, test_name="Block-median t-test")
-        plot_violins_with_stats(cond1_unsat, cond2_unsat, cond1=cond1, cond2=cond2,
-                                label="unsat", outdir=args.out, p_val=p_val_unsat, test_name="Block-median t-test")
-
-        if args.d:
-            _, p_val_pt, _, _ = run_block_median_ttest(cond1_turn_protein, cond2_turn_protein, block_size=args.block_size, label="protein_turn", min_nonzero_prop=args.block_min_nonzero)
-            print()
-            _, p_val_lt, _, _ = run_block_median_ttest(cond1_turn_lipid, cond2_turn_lipid, block_size=args.block_size, label="lipid_turn", min_nonzero_prop=args.block_min_nonzero)
-            print()
-
-            plot_violins_with_stats(cond1_turn_protein, cond2_turn_protein, cond1=cond1, cond2=cond2,
-                                    label="protein_turn", outdir=args.out, p_val=p_val_pt, test_name="Block-median t-test")
-            plot_violins_with_stats(cond1_turn_lipid, cond2_turn_lipid, cond1=cond1, cond2=cond2,
-                                    label="lipid_turn", outdir=args.out, p_val=p_val_lt, test_name="Block-median t-test")
-
-    # Plot histograms
-    if args.plot:
-        print("Plotting histograms...")
-        plot_histograms(cond1_redox, cond2_redox, cond1=cond1, cond2=cond2,
-                        label="redox", bins=100, outdir=args.out)
-        plot_histograms(cond1_unsat, cond2_unsat, cond1=cond1, cond2=cond2,
-                        label="unsat", bins=100, outdir=args.out)
-
-        if args.d:
-            plot_histograms(cond1_turn_protein, cond2_turn_protein, cond1=cond1, cond2=cond2,
-                            label="protein_turn", bins=100, outdir=args.out)
-            plot_histograms(cond1_turn_lipid, cond2_turn_lipid, cond1=cond1, cond2=cond2,
-                           label="lipid_turn", bins=100, outdir=args.out)
+    if pdf_pages is not None:
+        pdf_pages.close()
 

@@ -217,7 +217,18 @@ if __name__ == "__main__":
     parser.add_argument("--mask", "-m", action = "store_true", help = "Use existing masks")
     parser.add_argument("--sam", "-s", action = "store_true", help = "Use SAM masks if available")
     parser.add_argument("--output", "-o", type=str, required = True, help="Output directory for plots")
-    parser.add_argument("--drop-lowest-ptp", "-d", action="store_true", help="Remove the cluster with the lowest mean PTP (max-min) and recluster the remaining spectra")
+    parser.add_argument(
+        "--drop-lowest-ptp",
+        "-d",
+        type=int,
+        nargs="?",
+        const=1,
+        default=0,
+        help=(
+            "Drop the lowest-K clusters by mean per-pixel PTP (max-min) from the initial clustering, "
+            "then recluster the remaining spectra. Use '-d' for K=1 or '-d K' for K>1. Default: 0 (disabled)."
+        ),
+    )
     args = parser.parse_args()
 
     input_dirs, dir_metadata = [], []
@@ -287,26 +298,41 @@ if __name__ == "__main__":
         if args.n_clusters <= 1:
             print("--drop-lowest-ptp requested but n_clusters <= 1; skipping drop.")
         else:
-            ptp_vals = final_spectra.max(axis=0) - final_spectra.min(axis=0)  # per-pixel PTP
-            means = []
-            for i in range(args.n_clusters):
-                idx = (final_labels == i)
-                if not np.any(idx):
-                    means.append(np.inf)  # ignore empty clusters
-                else:
-                    means.append(float(np.mean(ptp_vals[idx])))
-            drop_idx = int(np.argmin(means))
-            print(f"Dropping cluster {drop_idx} with lowest mean PTP = {means[drop_idx]:.6f}")
+            k = int(args.drop_lowest_ptp)
+            if k < 0:
+                raise ValueError("--drop-lowest-ptp/-d must be >= 0")
 
-            drop_mask_global = (final_labels != drop_idx)
-            kept_count = int(drop_mask_global.sum())
-            if kept_count <= 0:
-                raise ValueError("All pixels removed by PTP drop; cannot recluster.")
+            # Cannot drop all clusters; keep at least 1 cluster for reclustering
+            k = min(k, args.n_clusters - 1)
+            if k == 0:
+                print("--drop-lowest-ptp specified as 0; skipping drop.")
+            else:
+                ptp_vals = final_spectra.max(axis=0) - final_spectra.min(axis=0)  # per-pixel PTP
+                means = []
+                for i in range(args.n_clusters):
+                    idx = (final_labels == i)
+                    if not np.any(idx):
+                        means.append(np.inf)  # ignore empty clusters
+                    else:
+                        means.append(float(np.mean(ptp_vals[idx])))
 
-            final_spectra = final_spectra[:, drop_mask_global]
-            final_n_clusters = max(1, args.n_clusters - 1)
-            final_embedding = GPU_UMAP(n_components=2, random_state=42).fit_transform(final_spectra.T)
-            final_labels = GPU_KMeans(n_clusters=final_n_clusters, random_state=42).fit_predict(final_spectra.T)
+                ranked = np.argsort(np.asarray(means))
+                drop_clusters = [int(x) for x in ranked[:k]]
+                drop_means = [means[i] for i in drop_clusters]
+                print(
+                    "Dropping clusters (lowest mean PTP): "
+                    + ", ".join([f"{cid} (mean={m:.6f})" for cid, m in zip(drop_clusters, drop_means)])
+                )
+
+                drop_mask_global = ~np.isin(final_labels, np.asarray(drop_clusters))
+                kept_count = int(drop_mask_global.sum())
+                if kept_count <= 0:
+                    raise ValueError("All pixels removed by PTP drop; cannot recluster.")
+
+                final_spectra = final_spectra[:, drop_mask_global]
+                final_n_clusters = max(1, args.n_clusters - k)
+                final_embedding = GPU_UMAP(n_components=2, random_state=42).fit_transform(final_spectra.T)
+                final_labels = GPU_KMeans(n_clusters=final_n_clusters, random_state=42).fit_predict(final_spectra.T)
 
     # # Original color from Zhi
     # colors = np.array([
