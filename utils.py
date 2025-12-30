@@ -6,15 +6,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from scipy.stats import chi2_contingency
 
+_RX = re.compile(r'^(\d+)[_-]')
 
-def get_number(filename):
-    match = re.search(r'(\d+)', filename)
-    return match.group(1) if match else None
+def get_number(filename: str) -> str:
+    base = os.path.basename(filename)
+    stem, _ = os.path.splitext(base)
+
+    m = _RX.match(stem)
+    if not m:
+        raise ValueError(
+            f"get_number(): expected filename like '<digits>-...ext' (digits before '-'), got '{base}'"
+        )
+    return m.group(1)
+
+# def get_number(filename):
+#     match = re.search(r'(\d+)', filename)
+#     return match.group(1) if match else None
 
 
 def match_files(files, label):
     return {get_number(f): f for f in files if label in f and (f.endswith('.tiff') or f.endswith('.tif'))}
+
+
+def safe_chi2(contingency: np.ndarray):
+    """Run chi-square on a contingency table after dropping empty rows/cols."""
+    keep_cols = contingency.sum(axis=0) > 0
+    keep_rows = contingency.sum(axis=1) > 0
+    cleaned = contingency[np.ix_(keep_rows, keep_cols)]
+    if cleaned.shape[0] < 2 or cleaned.shape[1] < 2:
+        return None, None, None, None
+    chi2, p, dof, expected = chi2_contingency(cleaned, correction=False)
+    return chi2, p, dof, expected
 
 
 class MultiScaleBlock(nn.Module):
@@ -64,39 +88,16 @@ class MultiScaleUNet(nn.Module):
         return self.out(y)
 
 
-def _prepare_tensor(img: np.ndarray) -> torch.Tensor:
-    """Convert an image array to a 3-channel float tensor in [0, 1]."""
-    if img.ndim == 2:
-        tensor = torch.from_numpy(img).float().unsqueeze(0).repeat(3, 1, 1)
-    elif img.ndim == 3:
-        tensor = torch.from_numpy(img).float()
-        tensor = tensor.permute(2, 0, 1)
-        c = tensor.shape[0]
-        if c == 1:
-            tensor = tensor.repeat(3, 1, 1)
-        elif c == 2:
-            tensor = torch.cat([tensor, tensor[:1]], dim=0)
-        elif c > 3:
-            tensor = tensor[:3]
-    else:
-        raise ValueError(f"Unsupported image dimensions: {img.shape}")
-
-    max_val = tensor.max()
-    if max_val > 0:
-        tensor = tensor / max_val
-    return tensor.unsqueeze(0)
-
-
 def generate_model_masks(root_path: str, weights_path: str, device: str = "cpu", threshold: float = 0.5):
-    """Generate ROI masks from 791-channel images using a trained MultiScaleUNet.
-
-    Returns a dict mapping ROI number (as string) to a float mask array in [0, 1].
     """
-    if not weights_path or not os.path.isfile(weights_path):
-        raise FileNotFoundError(f"Mask weights not found: {weights_path}")
-
+    Assumptions:
+      - All images are 1-channel uint16 TIFF with 12-bit range (0..4095).
+      - Convert to 8-bit via bit shift: img8 = img16 >> 4 (0..255).
+      - Normalize by /255 and replicate to 3 channels.
+    Returns: dict {roi_id (str): mask float32 HxW (0/1)}
+    """
     files = os.listdir(root_path)
-    pro_dict = match_files(files, "791")
+    pro_dict = match_files(files, "791")  # uses get_number(...) :contentReference[oaicite:3]{index=3}
     if not pro_dict:
         return {}
 
@@ -104,18 +105,32 @@ def generate_model_masks(root_path: str, weights_path: str, device: str = "cpu",
     state = torch.load(weights_path, map_location=device)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
+    # tolerate DataParallel saves
+    state = {k.replace("module.", "", 1): v for k, v in state.items()}
     model.load_state_dict(state)
     model.eval()
 
     masks = {}
     for roi, fname in pro_dict.items():
-        img_path = os.path.join(root_path, fname)
-        img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-        if img is None:
+        img16 = cv2.imread(os.path.join(root_path, fname), cv2.IMREAD_UNCHANGED)
+        if img16 is None:
             continue
-        tensor = _prepare_tensor(img).to(device)
-        with torch.no_grad():
-            pred = torch.sigmoid(model(tensor))
-        mask = (pred[0, 0].cpu().numpy() >= float(threshold)).astype(np.float32)
-        masks[roi] = mask
+
+        img8 = (img16 >> 4).astype(np.uint8)  # 12-bit -> 8-bit
+
+        x = (
+            torch.from_numpy(img8)
+            .float()
+            .div(255.0)
+            .unsqueeze(0)          # 1xHxW
+            .repeat(3, 1, 1)       # 3xHxW
+            .unsqueeze(0)          # 1x3xHxW
+            .to(device)
+        )
+
+        with torch.inference_mode():
+            prob = torch.sigmoid(model(x))[0, 0].cpu().numpy()
+
+        masks[roi] = (prob >= float(threshold)).astype(np.float32)
+
     return masks

@@ -2,8 +2,7 @@
 set -e
 
 block_size=32
-dir_name="processed_regions/zoom6"
-filter_mode="sigma"
+dir_name="processed_regions/zoom6_2"
 script_name="calculate_ratios_gp_v2.py"
 
 # All conditions in one run (multi-condition plotting/statistics)
@@ -15,11 +14,9 @@ python $script_name \
   ../${dir_name}/day35/1mm/ \
   ../${dir_name}/day35/cl/ \
   -c day7_0.1 day7_1mm day7_cl day35_0.1 day35_1mm day35_cl \
-  -d -s -b --block-size $block_size -f $filter_mode \
-  -r -u \
-  -o ../${dir_name}/all_conditions/ \
+  -d -s -r -u -o ../${dir_name}/all_conditions/ \
   --hide-ns \
-  -lt 780 \
-  -v
+  -m -mw ../unet_segmentation/best_student_supervised.pth \
+  -v -p
 
 echo "Done processing all conditions"

@@ -8,28 +8,18 @@ from utils import get_number, match_files, generate_model_masks
 from visualizations import save_ratio_image, plot_bars_all, plot_violins_all
 
 # Default parameters (no external config)
-BLOCK_SIZE = 32
+BLOCK_SIZE = 64
 BLOCK_MIN_NONZERO = 0.25
 HIDE_NON_SIGNIFICANT = False
 GAMMA_DEFAULT = 1.0
 CBAR_DEFAULT = "turbo"
-USE_MASK_DEFAULT = False
 LOW_PCT_DEFAULT = 1.0
 HIGH_PCT_DEFAULT = 99.0
-LOWER_THRESH_DEFAULT = 0.0
 
 def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
                     mask_map=None, **kwargs):
-    
-    low_pct = kwargs.get("low_pct", 2)
-    high_pct = kwargs.get("high_pct", 98)
     gamma = kwargs.get("gamma", 1.0)
     cbar = kwargs.get("cbar", 'turbo')
-    use_mask = kwargs.get("use_mask", True)
-    filter_mode = kwargs.get("filter_mode", "percentile")
-    sigma_k = float(kwargs.get("sigma_k", 3.0))
-    turnover_min = float(kwargs.get("turnover_min", 0.01))
-    lower_thresh = float(kwargs.get("lower_thresh", 0.0))
     
     fad = cv2.imread(os.path.join(root_path, fad_path), cv2.IMREAD_UNCHANGED)
     nadh = cv2.imread(os.path.join(root_path, nadh_path), cv2.IMREAD_UNCHANGED)
@@ -38,11 +28,10 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     fad[sat_mask] = 0
     nadh[sat_mask] = 0
 
-    if lower_thresh > 0:
-        fad[fad < lower_thresh] = 0
-        nadh[nadh < lower_thresh] = 0
-
     roi_id = get_number(fad_path)
+    if mask_map is not None and roi_id not in mask_map:
+        print("WARNING: no model mask for roi_id=", roi_id, "file=", fad_path)
+
     if mask_map is not None and roi_id in mask_map:
         roi_mask = mask_map[roi_id]
         if roi_mask.shape != fad.shape:
@@ -50,72 +39,33 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
         fad = (fad.astype(np.float32) * roi_mask).astype(fad.dtype)
         nadh = (nadh.astype(np.float32) * roi_mask).astype(nadh.dtype)
 
-    mask8 = np.ones_like(fad, dtype=np.float32)
-    if use_mask:
-        max_val = float(fad.max())
-        if max_val > 0:
-            fad8 = cv2.convertScaleAbs(fad, alpha=255.0 / max_val)
-            _, mask8 = cv2.threshold(fad8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        else:
-            mask8.fill(0)
-    
     f = fad.astype(np.float32)
     n = nadh.astype(np.float32)
     
     if suffix in ["redox", "unsat"]:
         den = f + n
         den[den == 0] = np.finfo(np.float32).eps
-        ratio = (f / den) * mask8
+        ratio = f / den
     elif suffix in ["protein_turn", "lipid_turn"]:
         n[n == 0] = np.finfo(np.float32).eps # Avoid division by zero
-        ratio = (f / n) * mask8 / 2 # CD channel use twice the power compared to CH channel
+        ratio = (f / n) / 2 # CD channel use twice the power compared to CH channel
     else:
         raise ValueError("Suffix must be one of 'redox', 'unsat', 'protein_turn', or 'lipid_turn'.")
     
-    # Filtering using either percentile bounds or sigma-based filtering (exclusive)
-    valid = ratio > 0
-    if np.any(valid):
-        if str(filter_mode).lower() == "sigma":
-            vals = ratio[valid]
-            mu = float(np.mean(vals))
-            sd = float(np.std(vals))
-            lower = mu - sigma_k * sd
-            upper = mu + sigma_k * sd
-            mask_keep = (ratio >= lower) & (ratio <= upper) & valid
-            ratio[~mask_keep] = 0
-            p_low, p_high = lower, upper
-        else:
-            p_low, p_high = np.percentile(ratio[valid], (low_pct, high_pct))
-            # Set to 0 if outside [p_low, p_high]
-            high_mask = ratio[valid] > p_high
-            low_mask = ratio[valid] < p_low
-            ratio_indices = np.where(valid)
-            ratio[ratio_indices[0][high_mask], ratio_indices[1][high_mask]] = 0
-            ratio[ratio_indices[0][low_mask], ratio_indices[1][low_mask]] = 0
-    else:
-        p_low, p_high = 0.0, 0.0
-
     # For lipid/protein turnover ratios, min-max scale to [0, 0.25]
+    valid = ratio > 0
     if suffix in ["protein_turn", "lipid_turn"] and np.any(valid):
-        # Recompute valid after zeroing out-of-range values
-        valid = ratio > 0
-        if np.any(valid):
-            vmin, vmax = ratio[valid].min(), ratio[valid].max()
-            if vmax > vmin:
-                scaled = (ratio[valid] - vmin) / (vmax - vmin)
-                ratio[valid] = scaled * 0.25
-            else:
-                ratio[valid] = 0.0
-        # After scaling, drop very small turnover values below threshold
-        if turnover_min > 0:
-            mask_small = (ratio > 0) & (ratio < float(turnover_min))
-            if np.any(mask_small):
-                ratio[mask_small] = 0.0
+        vmin, vmax = ratio[valid].min(), ratio[valid].max()
+        if vmax > vmin:
+            scaled = (ratio[valid] - vmin) / (vmax - vmin)
+            ratio[valid] = scaled * 0.25
+        else:
+            ratio[valid] = 0.0
 
 
     if save:
         save_name = get_number(fad_path) + f'_{suffix}_ratio.png'
-        save_ratio_image(ratio, root_path, save_name, low_pct, high_pct, gamma, cbar)
+        save_ratio_image(ratio, root_path, save_name, LOW_PCT_DEFAULT, HIGH_PCT_DEFAULT, gamma, cbar)
         tiff.imwrite(os.path.join(root_path, get_number(fad_path) + f'_{suffix}_ratio.tiff'), ratio.astype(np.float32))
     return ratio
 
@@ -285,37 +235,23 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--skip-redox", action="store_true", help="Skip redox analysis")
     parser.add_argument("-u", "--skip-unsat", action="store_true", help="Skip unsaturation analysis")
     parser.add_argument("--workers", "-w", type=int, default=(os.cpu_count() or 1), help="Number of parallel workers (default: os.cpu_count())")
-    parser.add_argument("--use-model-mask", action="store_true", help="Apply model-generated ROI masks from 791-channel images before segmentation")
-    parser.add_argument("--mask-weights", type=str, default=None, help="Path to the MultiScaleUNet mask weights (.pth)")
-    parser.add_argument("--mask-threshold", type=float, default=0.5, help="Sigmoid threshold for binarizing the predicted mask")
-    parser.add_argument("--lower-thresh", "-lt", type=float, default=0.0, help="Zero out raw pixels below this value before ratio calculation")
-    parser.add_argument("--pdf-out", "-p", type=str, default=None, help="Optional path to save all plots into a single multi-page PDF")
-    # Filtering controls
-    parser.add_argument("--filter-mode", "-f", choices=["percentile", "sigma"], default="percentile",
-                        help="Filtering mode for ratios: 'percentile' zeros values outside [low, high] percentiles; 'sigma' zeros values beyond mean±k*std.")
-    parser.add_argument("--low-pct", "-lp", type=float, default=1.0, help="Low percentile for percentile filtering")
-    parser.add_argument("--high-pct", "-hp", type=float, default=99.0, help="High percentile for percentile filtering")
-    parser.add_argument("--sigma-k", "-sk", type=float, default=3.0, help="K standard deviations for sigma filtering")
-    parser.add_argument("--turnover-min", "-tmin", type=float, default=0.01,
-                        help="For turnover ratios, zero values below this threshold after scaling")
+    parser.add_argument("--use-model-mask", "-m", action="store_true", help="Apply model-generated ROI masks from 791-channel images before segmentation")
+    parser.add_argument("--mask-weights", "-mw", type=str, default=None, help="Path to the MultiScaleUNet mask weights (.pth)")
+    parser.add_argument("--mask-threshold", "-mt", type=float, default=0.5, help="Sigmoid threshold for binarizing the predicted mask")
+    parser.add_argument("--pdf-out", "-p", action="store_true", help="Save all plots into a single multi-page PDF in the output directory")
+    parser.add_argument("--hide-ns", action="store_true", help="Hide non-significant comparisons in plots")
     args = parser.parse_args()
 
     if len(args.dirs) != len(args.conds):
         raise ValueError("dirs and conds must have the same length")
 
     save = args.save
+    hide_ns = args.hide_ns
     os.makedirs(args.out, exist_ok=True)
-    pdf_pages = PdfPages(args.pdf_out) if args.pdf_out else None
+    pdf_pages = PdfPages(os.path.join(args.out, "plots.pdf")) if args.pdf_out else None
     kwargs = {
-        "low_pct": float(args.low_pct),
-        "high_pct": float(args.high_pct),
         "gamma": GAMMA_DEFAULT,
         "cbar": CBAR_DEFAULT,
-        "use_mask": USE_MASK_DEFAULT,
-        "filter_mode": args.filter_mode,
-        "sigma_k": float(args.sigma_k),
-        "turnover_min": float(args.turnover_min),
-        "lower_thresh": float(args.lower_thresh),
     }
 
     # Collect ratios per condition
@@ -364,16 +300,16 @@ if __name__ == "__main__":
         redox_pairwise = pairwise_tests(redox_blocks)
         print_pairwise(redox_pairwise, "redox (block medians)")
         redox_p = {k: v[0] for k, v in redox_pairwise.items()}
-        plot_violins_all(redox_blocks, args.conds, redox_p, args.out, "Block-median t-test", "Redox ratio", "redox", HIDE_NON_SIGNIFICANT, pdf_pages)
-        plot_bars_all(redox_blocks, args.conds, redox_p, args.out, "Block-median t-test", "Redox ratio", "redox", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_violins_all(redox_blocks, args.conds, redox_p, args.out, "Block-median t-test", "Redox ratio", "redox", hide_ns, pdf_pages)
+        plot_bars_all(redox_blocks, args.conds, redox_p, args.out, "Block-median t-test", "Redox ratio", "redox", hide_ns, pdf_pages)
 
     if cond_unsat is not None:
         unsat_blocks = block_map(cond_unsat)
         unsat_pairwise = pairwise_tests(unsat_blocks)
         print_pairwise(unsat_pairwise, "unsaturation (block medians)")
         unsat_p = {k: v[0] for k, v in unsat_pairwise.items()}
-        plot_violins_all(unsat_blocks, args.conds, unsat_p, args.out, "Block-median t-test", "Unsaturation ratio", "unsat", HIDE_NON_SIGNIFICANT, pdf_pages)
-        plot_bars_all(unsat_blocks, args.conds, unsat_p, args.out, "Block-median t-test", "Unsaturation ratio", "unsat", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_violins_all(unsat_blocks, args.conds, unsat_p, args.out, "Block-median t-test", "Unsaturation ratio", "unsat", hide_ns, pdf_pages)
+        plot_bars_all(unsat_blocks, args.conds, unsat_p, args.out, "Block-median t-test", "Unsaturation ratio", "unsat", hide_ns, pdf_pages)
 
     if args.deuterated:
         pt_blocks = block_map(cond_turn_protein)
@@ -384,10 +320,10 @@ if __name__ == "__main__":
         print_pairwise(lt_pairwise, "lipid turnover (block medians)")
         pt_p = {k: v[0] for k, v in pt_pairwise.items()}
         lt_p = {k: v[0] for k, v in lt_pairwise.items()}
-        plot_violins_all(pt_blocks, args.conds, pt_p, args.out, "Block-median t-test", "Protein turnover ratio", "protein_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
-        plot_bars_all(pt_blocks, args.conds, pt_p, args.out, "Block-median t-test", "Protein turnover ratio", "protein_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
-        plot_violins_all(lt_blocks, args.conds, lt_p, args.out, "Block-median t-test", "Lipid turnover ratio", "lipid_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
-        plot_bars_all(lt_blocks, args.conds, lt_p, args.out, "Block-median t-test", "Lipid turnover ratio", "lipid_turn", HIDE_NON_SIGNIFICANT, pdf_pages)
+        plot_violins_all(pt_blocks, args.conds, pt_p, args.out, "Block-median t-test", "Protein turnover ratio", "protein_turn", hide_ns, pdf_pages)
+        plot_bars_all(pt_blocks, args.conds, pt_p, args.out, "Block-median t-test", "Protein turnover ratio", "protein_turn", hide_ns, pdf_pages)
+        plot_violins_all(lt_blocks, args.conds, lt_p, args.out, "Block-median t-test", "Lipid turnover ratio", "lipid_turn", hide_ns, pdf_pages)
+        plot_bars_all(lt_blocks, args.conds, lt_p, args.out, "Block-median t-test", "Lipid turnover ratio", "lipid_turn", hide_ns, pdf_pages)
 
     if pdf_pages is not None:
         pdf_pages.close()

@@ -1,11 +1,14 @@
 import argparse, os, numpy as np, pandas as pd, rampy as rp, tifffile, cv2
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from cuml import UMAP as GPU_UMAP
 from cuml.cluster import KMeans as GPU_KMeans
 from scipy.interpolate import interp1d
-from scipy.stats import chi2_contingency  # (Imported earlier; safe_chi2 retained though not used)
+from visualizations import (
+    plot_cluster_umap,
+    plot_cluster_spectra,
+    map_clusters,
+    plot_cluster_composition,
+    plot_cluster_composition_by_condition,
+)
 
 # Shortened code, accelerated, and segmenting out background using SAM (use other code to pre-generate masks)
 # Further accelerated, add stats testing
@@ -23,81 +26,6 @@ def analyze_cluster_composition(cluster_labels, n_clusters):
     ratios = counts / cluster_labels.size if cluster_labels.size > 0 else np.zeros(n_clusters)
     return pd.DataFrame({"cluster_id": np.arange(n_clusters), "count": counts, "ratio": ratios})
 
-def plot_cluster_umap(embedding, cluster_labels, n_clusters, colors, output_folder):
-    # Filter out data points beyond 0.01 and 99.99 percentile range
-    if embedding.shape[0] == 0:
-        return
-    low_pct, high_pct = 0.2, 99.8
-    x_min, x_max = np.percentile(embedding[:, 0], [low_pct, high_pct])
-    y_min, y_max = np.percentile(embedding[:, 1], [low_pct, high_pct])
-    mask_range = (embedding[:, 0] >= x_min) & (embedding[:, 0] <= x_max) & \
-                 (embedding[:, 1] >= y_min) & (embedding[:, 1] <= y_max)
-    filtered_embedding = embedding[mask_range]
-    filtered_labels = cluster_labels[mask_range]
-
-    plt.figure(figsize=(8, 8))
-    for i in range(n_clusters):
-        mask = filtered_labels == i
-        if np.any(mask):
-            plt.scatter(filtered_embedding[mask, 0], filtered_embedding[mask, 1], c=[colors[i]], label=f"Cluster {i+1}", alpha=0.6, s=5)
-            plt.text(np.mean(filtered_embedding[mask, 0]), np.mean(filtered_embedding[mask, 1]), f"{i+1}", fontsize=12, ha="center", va="center")
-    plt.xlabel("UMAP 1"); plt.ylabel("UMAP 2"); plt.xticks([]); plt.yticks([])
-    plt.legend(prop={"size": 10}, loc="best")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_folder, "clusters_umap.tiff"), dpi=300, bbox_inches="tight")
-    plt.close()
-
-def plot_cluster_spectra(spectra, cluster_labels, n_clusters, wavenumbers, colors, output_folder):
-    if spectra.shape[1] == 0:
-        return
-    plt.figure(figsize=(6, 10))
-    for i in range(n_clusters):
-        mask = cluster_labels == i
-        if np.any(mask):
-            mean = np.mean(spectra[:, mask], axis=1)
-            std = np.std(spectra[:, mask], axis=1)
-            plt.plot(wavenumbers, mean + i * 0.5, color=colors[i], label=f"Cluster {i+1}", alpha=0.5)
-            plt.fill_between(wavenumbers, mean + i * 0.5 - std, mean + i * 0.5 + std, color=colors[i], alpha=0.2)
-    plt.xlabel(r"Wavenumber (cm$^{-1}$)"); plt.ylabel("Normalized Intensity")
-    plt.legend(prop={"size": 10}); plt.tight_layout()
-    plt.grid()
-    plt.savefig(os.path.join(output_folder, "cluster_spectra.tiff"), dpi=300)
-    plt.close()
-
-def map_clusters(cluster_labels, img_shape, indices, n_clusters, colors, output_folder, tag: str = "combined"):
-    label_map = np.full(img_shape[1:], -1, dtype=np.int32)  # -1 = background
-    if cluster_labels.size:
-        label_map[indices] = cluster_labels
-    rgb_map = np.zeros((*img_shape[1:], 3), dtype=np.float32)
-    for i in range(n_clusters): rgb_map[label_map == i] = colors[i]
-    fname = f"clusters_map_{tag}.tiff"
-    tifffile.imwrite(os.path.join(output_folder, fname), (rgb_map * 255).astype(np.uint8))
-
-def plot_cluster_composition(cluster_stats, n_clusters, output_folder, tag: str = "combined"):
-    plt.figure(figsize=(8,6))
-    x = np.arange(n_clusters)
-    plt.bar(x, cluster_stats["ratio"], color="royalblue", alpha=0.7)
-    plt.xticks(x, [f"Cluster {i+1}" for i in x], fontsize=10, rotation=45)
-    plt.ylabel("Fraction of Pixels in Cluster")
-    plt.tight_layout()
-    fname = f"cluster_composition_{tag}.tiff"
-    plt.savefig(os.path.join(output_folder, fname), dpi=300, bbox_inches="tight")
-    plt.close()
-
-def safe_chi2(contingency: np.ndarray):
-    # 1) remove columns with zero total and rows with zero total
-    keep_cols = contingency.sum(axis=0) > 0
-    keep_rows = contingency.sum(axis=1) > 0
-    cleaned = contingency[np.ix_(keep_rows, keep_cols)]
-
-    # 2) must be at least 2x2 to test independence
-    if cleaned.shape[0] < 2 or cleaned.shape[1] < 2:
-        print("Warning: Contingency table too small after cleaning, skipping chi-square test.")
-        return None, None, None, None  # or print("Skipped: <2x2 after cleaning")
-
-    # 3) run chi-square (no Yates correction for RxC)
-    chi2, p, dof, expected = chi2_contingency(cleaned, correction=False)
-    return chi2, p, dof, expected
 
 def smooth_spectrum(spectrum, lamda=0.2):
     return rp.smooth(np.arange(len(spectrum)), spectrum, method="whittaker", Lambda=lamda)
@@ -121,23 +49,39 @@ def preprocess_spectra(spectra, wavenumbers, baseline_interpolator):
     for i in np.where(valid)[0]: spectra[:, i] = smooth_spectrum(spectra[:, i])
     return np.nan_to_num(spectra, nan=0.0, posinf=1.0, neginf=0.0)
 
-def load_hyperstacks_from_dirs(input_dirs, use_sam):
+def resample_stack_to_expected_channels(stack, expected_channels, spectra_start, spectra_end):
+    if stack.shape[0] == expected_channels:
+        return stack.astype(np.float32)
+
+    orig_channels = stack.shape[0]
+    old_axis = np.linspace(spectra_start, spectra_end, orig_channels)
+    new_axis = np.linspace(spectra_start, spectra_end, expected_channels)
+    flat = stack.reshape(orig_channels, -1).astype(np.float32)
+    f = interp1d(old_axis, flat, axis=0, kind="linear", fill_value="extrapolate", bounds_error=False)
+    resampled = f(new_axis).reshape((expected_channels,) + stack.shape[1:])
+    print(f"Interpolated stack from {orig_channels} to {expected_channels} channels.")
+    return resampled.astype(np.float32)
+
+
+def load_hyperstacks_from_dirs(input_dirs, expected_channels, spectra_start, spectra_end):
     stacks, valid_dirs = [], []
-    masks = list()
     for d in input_dirs:
-        files = sorted([f for f in os.listdir(d) if f[0].isdigit() and f.lower().endswith(('.tif', '.tiff'))])
-        stacks.append(np.stack([tifffile.imread(os.path.join(d, f)) for f in files], axis=0))
+        stack_path = os.path.join(d, "masked_stack.tif")
+        if not os.path.isfile(stack_path):
+            continue
+
+        stack = tifffile.imread(stack_path)
+        if stack.ndim == 2:
+            stack = stack[np.newaxis, ...]
+        if stack.shape[0] != expected_channels:
+            stack = resample_stack_to_expected_channels(stack, expected_channels, spectra_start, spectra_end)
+        else:
+            stack = stack.astype(np.float32)
+
+        stacks.append(stack)
         valid_dirs.append(d)
 
-        if use_sam:
-            fl = [f for f in os.listdir(d) if "mask" in f]
-
-            if len(fl) > 0:
-                masks.append(cv2.imread(os.path.join(d, fl[0]), cv2.IMREAD_GRAYSCALE))
-            else:
-                raise FileNotFoundError(f"No SAM mask found in {d}. Please generate first")
-
-    return stacks, valid_dirs, masks
+    return stacks, valid_dirs
 
 def preprocess_all_stacks(stacks, baseline_interpolator, wavenumbers,
                           drop_invalid=True, deduplicate=True):
@@ -209,13 +153,13 @@ def preprocess_all_stacks(stacks, baseline_interpolator, wavenumbers,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hyperspectral SRS Image Analysis for multiple directories (combined analysis).")
     parser.add_argument("baseline_path", type=str, help="Path to water baseline CSV")
-    parser.add_argument("dirs", nargs="+", help="One or more directories containing stacks or subdirectories with stacks")
+    parser.add_argument("dirs", nargs="+", help="One or more directories containing stacks")
+    parser.add_argument("--conds", "-C", nargs="+", required=True, help="Condition names (match order of dirs)")
     parser.add_argument("--n_clusters", "-n", type=int, default=6)
     parser.add_argument("--spectra_start", type=float, default=2700)
     parser.add_argument("--spectra_end", type=float, default=3100)
     parser.add_argument("--expected_channels", "-c", type=int, default=62)
     parser.add_argument("--mask", "-m", action = "store_true", help = "Use existing masks")
-    parser.add_argument("--sam", "-s", action = "store_true", help = "Use SAM masks if available")
     parser.add_argument("--output", "-o", type=str, required = True, help="Output directory for plots")
     parser.add_argument(
         "--drop-lowest-ptp",
@@ -231,45 +175,54 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if len(args.dirs) != len(args.conds):
+        raise ValueError("dirs and conds must have the same length")
+
     input_dirs, dir_metadata = [], []
-    def looks_valid_stack(d: str) -> bool:
-        files = [f for f in os.listdir(d) if f[0].isdigit() and f.endswith((".tif", ".tiff"))]
-        return len(files) == args.expected_channels
 
-    for base in args.dirs:
+    def find_masked_stack_dirs(base: str):
+        """Recursively search for all directories containing masked_stack.tif under base."""
+        found = []
+        for dir_path, _, files in os.walk(base):
+            if "masked_stack.tif" in files:
+                found.append(dir_path)
+        return sorted(found)
+
+    for base, cond in zip(args.dirs, args.conds):
         if not os.path.isdir(base):
-            continue
-        # If base itself is a stack dir
-        if looks_valid_stack(base) and "out" not in os.path.basename(base).lower():
-            print(f"Found dir: {base}")
-            input_dirs.append(base)
-            dir_metadata.append({"dir": base})
-            continue
-        # Otherwise scan subdirectories
-        for dir_path, _, _ in os.walk(base):
-            folder = dir_path.lower()
-            if "out" in folder:
-                continue
-            try:
-                if looks_valid_stack(dir_path):
-                    print(f"Found dir: {dir_path}")
-                    input_dirs.append(dir_path)
-                    dir_metadata.append({"dir": dir_path})
-            except PermissionError:
-                continue
+            raise ValueError(f"Directory not found: {base}")
 
-    print(f"Found {len(input_dirs)} valid directories.")
-    stacks, valid_dirs, masks = load_hyperstacks_from_dirs(input_dirs, args.sam)
+        stack_dirs = find_masked_stack_dirs(base)
+        if not stack_dirs:
+            raise FileNotFoundError(f"masked_stack.tif not found under {base}")
+
+        for stack_dir in stack_dirs:
+            stack_path = os.path.join(stack_dir, "masked_stack.tif")
+            try:
+                with tifffile.TiffFile(stack_path) as tf:
+                    if len(tf.pages) == 0:
+                        raise FileNotFoundError(f"masked_stack.tif unreadable in {stack_dir}")
+            except Exception as exc:
+                raise FileNotFoundError(f"masked_stack.tif unreadable in {stack_dir}") from exc
+
+            print(f"Found stack: {stack_path} (condition: {cond})")
+            input_dirs.append(stack_dir)
+            dir_metadata.append({"dir": stack_dir, "condition": cond})
+
+    print(f"Found {len(input_dirs)} valid stack directories across {len(args.conds)} conditions.")
+    stacks, _ = load_hyperstacks_from_dirs(
+        input_dirs,
+        args.expected_channels,
+        args.spectra_start,
+        args.spectra_end,
+    )
 
     if args.mask:
         for idx, stack in enumerate(stacks):
             n_channels = stack.shape[0]
             
             protein_img = stack[int(0.6 * n_channels)]
-            if args.sam and np.sum(masks[idx]) > 0.6 * masks[idx].size:
-                mask8 = masks[idx]
-            else:
-                mask8 = mask_generation(protein_img)
+            mask8 = mask_generation(protein_img)
             
             if mask8.max() > 1:
                 mask8 = (mask8 > 128).astype(np.uint8)
@@ -358,6 +311,7 @@ if __name__ == "__main__":
     plot_cluster_spectra(final_spectra, final_labels, final_n_clusters, wavenumbers, colors, out_dir)
 
     pixel_offset = 0
+    condition_counts = {meta["condition"]: np.zeros(final_n_clusters, dtype=int) for meta in dir_metadata}
     # For mapping back per directory when dropping, we need per-directory keep mask derived from drop_mask_global
     # Build starts from per-directory sizes (counts before optional drop)
     dir_sizes = [len(idx_pair[0]) for idx_pair in all_indices]
@@ -381,10 +335,18 @@ if __name__ == "__main__":
             r_kept, c_kept = r, c
 
         stats = analyze_cluster_composition(dir_labels, final_n_clusters)
+        condition_counts[meta["condition"]] += stats["count"].to_numpy()
         stats.to_csv(os.path.join(meta["dir"], "cluster_stats_combined.csv"), index=False)
         plot_cluster_composition(stats, final_n_clusters, meta["dir"], tag="combined")
         map_clusters(dir_labels, all_img_shapes[i], (r_kept, c_kept), final_n_clusters, colors, meta["dir"], tag="combined")
         print(f"Processed {meta['dir']}.")
+
+    condition_ratios = {}
+    for cond, counts in condition_counts.items():
+        total = float(counts.sum())
+        condition_ratios[cond] = counts / total if total > 0 else np.zeros_like(counts, dtype=float)
+
+    plot_cluster_composition_by_condition(condition_ratios, out_dir, tag="by_condition")
 
     # Condition-level comparison removed for condition-agnostic combined analysis
     
