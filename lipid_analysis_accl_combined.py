@@ -8,9 +8,6 @@ from scipy.stats import ttest_ind, mannwhitneyu
 from scipy.spatial.distance import pdist
 from matplotlib.backends.backend_pdf import PdfPages
 from visualizations import (
-    significance_label,
-    standard_error,
-    annotate_pairs,
     plot_bars_all,
     plot_violins_all,
     save_mask_overlay_gray,
@@ -57,17 +54,20 @@ def filter_small_components(mask, fraction=0.1, min_pixels: int = 5, verbose: bo
 
 def seg_droplets(root_path, img_path, threshold: float = 1.0, fraction: float = 0.5, min_pixels: int = 5, verbose: bool = False):
     lipid = cv2.imread(os.path.join(root_path, img_path), cv2.IMREAD_UNCHANGED)
+    roi_id = get_number(img_path)
+    roi_dir = os.path.join(root_path, f"roi_{roi_id}")
+    os.makedirs(roi_dir, exist_ok=True)
     # Threshold interpreted as "top percentile" (e.g., 1.0 means keep top 1% intensities)
     top = float(np.clip(threshold, 0.0, 100.0))
     thresh = np.percentile(lipid, [100 - top, 100])
     seg_lipid = np.where(lipid < thresh[0], 0, 255)
     mask, props_df = filter_small_components(seg_lipid, fraction=fraction, min_pixels=min_pixels, verbose=verbose)
 
-    # Save mask image (keep output directory as root_path per requirements)
-    cv2.imwrite(os.path.join(root_path, f"roi{get_number(img_path)}_seg_lipid.png"), (mask * 255).astype(np.uint8))
+    # Save mask image at root (not inside ROI subdirectory)
+    cv2.imwrite(os.path.join(root_path, f"{roi_id}_seg_lipid.png"), (mask * 255).astype(np.uint8))
 
     # Overlay masked regions on original image with translucent red color
-    overlay_path = os.path.join(root_path, f"roi{get_number(img_path)}_seg_lipid_overlay.png")
+    overlay_path = os.path.join(roi_dir, f"{roi_id}_seg_lipid_overlay.png")
     save_mask_overlay_gray(lipid, mask, overlay_path, title="Lipid Droplet Segmentation Overlay", mask_cmap="Reds")
 
     mask_binary = (mask > 0).astype(np.uint8)
@@ -106,8 +106,8 @@ def tests_droplet_sizes(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pag
     sizes = {cond: pd.concat(dfs, ignore_index=True)["area"].values for cond, dfs in cond_dfs_map.items()}
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(sizes).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "droplet sizes (t-test shown)")
-    plot_bars_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns, pdf_pages)
-    plot_violins_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns, pdf_pages)
+    plot_bars_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    plot_violins_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns=hide_ns, pdf_pages=pdf_pages)
 
 
 def test_centroid_distance(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
@@ -121,23 +121,23 @@ def test_centroid_distance(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_
         distances[cond] = np.asarray(dists)
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(distances).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "centroid distances (t-test shown)")
-    plot_bars_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns, pdf_pages)
-    plot_violins_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns, pdf_pages)
+    plot_bars_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    plot_violins_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages)
 
 
 def test_droplet_counts(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
     counts = {cond: np.asarray([df.shape[0] for df in dfs]) for cond, dfs in cond_dfs_map.items()}
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(counts).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "droplet counts (t-test shown)")
-    plot_bars_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns, pdf_pages)
-    plot_violins_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns, pdf_pages)
+    plot_bars_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    plot_violins_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns=hide_ns, pdf_pages=pdf_pages)
 
 
 def test_area_fraction(cond_frac_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(cond_frac_map).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "area fraction (t-test shown)")
-    plot_bars_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns, pdf_pages)
-    plot_violins_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns, pdf_pages)
+    plot_bars_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    plot_violins_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages)
 
 
 if __name__ == "__main__":

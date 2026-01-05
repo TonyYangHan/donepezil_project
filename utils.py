@@ -1,10 +1,5 @@
-import os
-import re
-import cv2
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import os, re, cv2, numpy as np, torch, torch.nn as nn, torch.nn.functional as F, tifffile as tiff
+from pathlib import Path
 from torch.utils.checkpoint import checkpoint
 from scipy.stats import chi2_contingency
 
@@ -20,10 +15,6 @@ def get_number(filename: str) -> str:
             f"get_number(): expected filename like '<digits>-...ext' (digits before '-'), got '{base}'"
         )
     return m.group(1)
-
-# def get_number(filename):
-#     match = re.search(r'(\d+)', filename)
-#     return match.group(1) if match else None
 
 
 def match_files(files, label):

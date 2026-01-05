@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import tifffile
 from matplotlib import cm
+from scipy.stats import pearsonr
 
 # Functions for hyperspectral image clustering plots
 
@@ -85,7 +86,8 @@ def plot_bars_all(metric_values, cond_order, pairwise_p, outdir, test_name, ylab
 
 	span = max(max(means) + max(ses, default=0) - min(means), 1e-6)
 	y_top = max(means) + max(ses, default=0)
-	y_min = max(min(means) - 0.05 * span, 0)
+	# Extend downward a bit more and shrink upward padding so bars stay tighter vertically
+	y_min = max(min(means) - 0.15 * span, 0)
 	y_max = y_top + 0.12 * span + 0.05 * span * len(pairwise_p)
 	ax.set_ylim(y_min, y_max)
 
@@ -158,7 +160,7 @@ def plot_region_scatter_3d(scatter_map, outdir, region):
 	plt.close(fig)
 
 
-def plot_cluster_umap(embedding, cluster_labels, n_clusters, colors, output_folder):
+def plot_cluster_umap(embedding, cluster_labels, n_clusters, colors, output_folder, pdf_pages=None):
 	# Filter out data points beyond 0.01 and 99.99 percentile range
 	if embedding.shape[0] == 0:
 		return
@@ -166,11 +168,11 @@ def plot_cluster_umap(embedding, cluster_labels, n_clusters, colors, output_fold
 	x_min, x_max = np.percentile(embedding[:, 0], [low_pct, high_pct])
 	y_min, y_max = np.percentile(embedding[:, 1], [low_pct, high_pct])
 	mask_range = (embedding[:, 0] >= x_min) & (embedding[:, 0] <= x_max) & \
-	             (embedding[:, 1] >= y_min) & (embedding[:, 1] <= y_max)
+				 (embedding[:, 1] >= y_min) & (embedding[:, 1] <= y_max)
 	filtered_embedding = embedding[mask_range]
 	filtered_labels = cluster_labels[mask_range]
 
-	plt.figure(figsize=(8, 8))
+	fig = plt.figure(figsize=(8, 8))
 	for i in range(n_clusters):
 		mask = filtered_labels == i
 		if np.any(mask):
@@ -180,13 +182,15 @@ def plot_cluster_umap(embedding, cluster_labels, n_clusters, colors, output_fold
 	plt.legend(prop={"size": 10}, loc="best")
 	plt.tight_layout()
 	plt.savefig(os.path.join(output_folder, "clusters_umap.tiff"), dpi=300, bbox_inches="tight")
-	plt.close()
+	if pdf_pages is not None:
+		pdf_pages.savefig(fig)
+	plt.close(fig)
 
 
-def plot_cluster_spectra(spectra, cluster_labels, n_clusters, wavenumbers, colors, output_folder):
+def plot_cluster_spectra(spectra, cluster_labels, n_clusters, wavenumbers, colors, output_folder, pdf_pages=None):
 	if spectra.shape[1] == 0:
 		return
-	plt.figure(figsize=(6, 10))
+	fig = plt.figure(figsize=(6, 10))
 	for i in range(n_clusters):
 		mask = cluster_labels == i
 		if np.any(mask):
@@ -198,10 +202,12 @@ def plot_cluster_spectra(spectra, cluster_labels, n_clusters, wavenumbers, color
 	plt.legend(prop={"size": 10}); plt.tight_layout()
 	plt.grid()
 	plt.savefig(os.path.join(output_folder, "cluster_spectra.tiff"), dpi=300)
-	plt.close()
+	if pdf_pages is not None:
+		pdf_pages.savefig(fig)
+	plt.close(fig)
 
 
-def map_clusters(cluster_labels, img_shape, indices, n_clusters, colors, output_folder, tag: str = "combined"):
+def map_clusters(cluster_labels, img_shape, indices, n_clusters, colors, output_folder, tag: str = "combined", pdf_pages=None):
 	label_map = np.full(img_shape[1:], -1, dtype=np.int32)  # -1 = background
 	if cluster_labels.size:
 		label_map[indices] = cluster_labels
@@ -211,9 +217,19 @@ def map_clusters(cluster_labels, img_shape, indices, n_clusters, colors, output_
 	fname = f"clusters_map_{tag}.tiff"
 	tifffile.imwrite(os.path.join(output_folder, fname), (rgb_map * 255).astype(np.uint8))
 
+	# Optional PDF export for quick review
+	if pdf_pages is not None:
+		fig, ax = plt.subplots(figsize=(6, 6))
+		ax.imshow(rgb_map)
+		ax.set_title(f"Cluster map ({tag})")
+		ax.axis("off")
+		fig.tight_layout()
+		pdf_pages.savefig(fig)
+		plt.close(fig)
 
-def plot_cluster_composition(cluster_stats, n_clusters, output_folder, tag: str = "combined"):
-	plt.figure(figsize=(8,6))
+
+def plot_cluster_composition(cluster_stats, n_clusters, output_folder, tag: str = "combined", pdf_pages=None):
+	fig = plt.figure(figsize=(8,6))
 	x = np.arange(n_clusters)
 	plt.bar(x, cluster_stats["ratio"], color="royalblue", alpha=0.7)
 	plt.xticks(x, [f"Cluster {i+1}" for i in x], fontsize=10, rotation=45)
@@ -221,28 +237,91 @@ def plot_cluster_composition(cluster_stats, n_clusters, output_folder, tag: str 
 	plt.tight_layout()
 	fname = f"cluster_composition_{tag}.tiff"
 	plt.savefig(os.path.join(output_folder, fname), dpi=300, bbox_inches="tight")
-	plt.close()
+	if pdf_pages is not None:
+		pdf_pages.savefig(fig)
+	plt.close(fig)
 
 
-def plot_cluster_composition_by_condition(condition_ratios, output_folder, tag: str = "by_condition"):
+def plot_cluster_composition_by_condition(condition_ratios, output_folder, tag: str = "by_condition", colors=None, pdf_pages=None):
 	if not condition_ratios:
 		return
 	conditions = list(condition_ratios.keys())
 	n_clusters = len(next(iter(condition_ratios.values())))
-	x = np.arange(n_clusters)
-	n_cond = len(conditions)
-	bar_width = 0.8 / max(n_cond, 1)
-	shift = (n_cond - 1) * bar_width / 2.0
-	cmap = cm.get_cmap("tab10")
-	plt.figure(figsize=(10, 6))
-	for j, cond in enumerate(conditions):
-		ratios = np.asarray(condition_ratios[cond])
-		plt.bar(x + j * bar_width - shift, ratios, width=bar_width, label=cond, color=cmap(j % 10), alpha=0.85)
-	plt.xticks(x, [f"Cluster {i+1}" for i in x], rotation=45, ha="right")
-	plt.ylabel("Fraction of Pixels in Cluster")
+	x = np.arange(len(conditions))
+	# Use provided color palette when available to stay consistent with UMAP/spectra plots
+	palette = colors if colors is not None else cm.get_cmap("tab10")(np.linspace(0, 1, max(n_clusters, 1)))
+	fig = plt.figure(figsize=(10, 6))
+	bar_width = 0.8 / max(n_clusters, 1)
+	shift = (n_clusters - 1) * bar_width / 2.0
+	for k in range(n_clusters):
+		heights = np.array([np.asarray(condition_ratios[c])[k] if len(condition_ratios[c]) > k else 0.0 for c in conditions], dtype=float)
+		color = palette[k % len(palette)] if len(np.atleast_1d(palette)) else None
+		plt.bar(x + k * bar_width - shift, heights, width=bar_width, label=f"Cluster {k+1}", color=color, alpha=0.85)
+	plt.xticks(x, conditions, rotation=45, ha="right")
+	plt.ylabel("Fraction of spectra per condition")
 	plt.ylim(0, 1)
-	plt.legend()
+	plt.legend(title="Cluster")
 	plt.tight_layout()
 	fname = f"cluster_composition_{tag}.tiff"
 	plt.savefig(os.path.join(output_folder, fname), dpi=300, bbox_inches="tight")
-	plt.close()
+	if pdf_pages is not None:
+		pdf_pages.savefig(fig)
+	plt.close(fig)
+
+
+# Correlation plots for turnover vs droplet metrics (used by zoom6_corr.py and zoom1_corr.py)
+def plot_condition_correlation(xs, ys, cond_names, colors, outdir, title, xlabel, ylabel, pdf_pages=None, dedup_labels=True, stat_label: str = "", min_value: float = 0.0):
+	xs = np.asarray(xs, dtype=float)
+	ys = np.asarray(ys, dtype=float)
+	mask = (np.isfinite(xs) & np.isfinite(ys) & (xs >= min_value) & (ys >= min_value))
+	os.makedirs(outdir, exist_ok=True)
+
+	if mask.sum() == 0:
+		return  # nothing to plot
+
+	xs = xs[mask]
+	ys = ys[mask]
+	cond_names = np.asarray(cond_names)[mask]
+	colors = np.asarray(colors, dtype=object)[mask]
+
+	fig, ax = plt.subplots(figsize=(6, 6))
+	seen = set()
+	for x_val, y_val, cond, color in zip(xs, ys, cond_names, colors):
+		label = None
+		if not dedup_labels or cond not in seen:
+			label = cond
+			seen.add(cond)
+		ax.scatter(x_val, y_val, color=color, s=65, alpha=0.9, label=label)
+
+	r_text = "r=n/a"
+	p_text = "p=n/a"
+	if xs.size >= 2:
+		slope, intercept = np.polyfit(xs, ys, 1)
+		x_line = np.array([xs.min(), xs.max()])
+		y_line = slope * x_line + intercept
+		ax.plot(x_line, y_line, color="black", linestyle="--", linewidth=1.1, label="Linear fit")
+		try:
+			r_val, p_val = pearsonr(xs, ys)
+			r_text = f"r={r_val:.3f}"
+			p_text = f"p={p_val:.3g}"
+		except Exception:
+			pass
+
+	x_lab = xlabel
+	y_lab = ylabel
+	ax.set_xlabel(x_lab)
+	ax.set_ylabel(y_lab)
+	ax.set_title(f"{title} ({r_text}, {p_text})")
+
+	# Only draw legend if we actually have labeled artists
+	handles, labels = ax.get_legend_handles_labels()
+	if labels:
+		ax.legend()
+
+	ax.grid(alpha=0.25)
+	fig.tight_layout()
+	fname = title.lower().replace(" ", "_").replace("/", "-") + ".png"
+	fig.savefig(os.path.join(outdir, fname), dpi=300)
+	if pdf_pages is not None:
+		pdf_pages.savefig(fig)
+	plt.close(fig)

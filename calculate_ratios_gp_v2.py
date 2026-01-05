@@ -64,8 +64,10 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
 
 
     if save:
+        roi_dir = os.path.join(root_path, f"roi_{roi_id}") if suffix in ["protein_turn", "lipid_turn"] else root_path
+        os.makedirs(roi_dir, exist_ok=True)
         save_name = get_number(fad_path) + f'_{suffix}_ratio.png'
-        save_ratio_image(ratio, root_path, save_name, LOW_PCT_DEFAULT, HIGH_PCT_DEFAULT, gamma, cbar)
+        save_ratio_image(ratio, roi_dir, save_name, LOW_PCT_DEFAULT, HIGH_PCT_DEFAULT, gamma, cbar)
         tiff.imwrite(os.path.join(root_path, get_number(fad_path) + f'_{suffix}_ratio.tiff'), ratio.astype(np.float32))
     return ratio
 

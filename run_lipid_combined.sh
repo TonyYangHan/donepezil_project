@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-dir_name="processed_regions/zoom6"
+dir_name="processed_regions/zoom6_2"
 script_name="lipid_analysis_accl_combined.py"
 
 # Analyze all conditions together; the Python script will run all pairwise comparisons internally.

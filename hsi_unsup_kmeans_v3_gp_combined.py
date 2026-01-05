@@ -1,4 +1,5 @@
 import argparse, os, numpy as np, pandas as pd, rampy as rp, tifffile, cv2
+from matplotlib.backends.backend_pdf import PdfPages
 from cuml import UMAP as GPU_UMAP
 from cuml.cluster import KMeans as GPU_KMeans
 from scipy.interpolate import interp1d
@@ -161,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--expected_channels", "-c", type=int, default=62)
     parser.add_argument("--mask", "-m", action = "store_true", help = "Use existing masks")
     parser.add_argument("--output", "-o", type=str, required = True, help="Output directory for plots")
+    parser.add_argument("--pdf", action="store_true", help="Also save all generated plots into a single PDF in the output directory")
     parser.add_argument(
         "--drop-lowest-ptp",
         "-d",
@@ -305,48 +307,60 @@ if __name__ == "__main__":
 
     out_dir = args.output
     os.makedirs(out_dir, exist_ok=True)
-    
-    # Use spectra/labels after optional drop so lengths match
-    plot_cluster_umap(final_embedding, final_labels, final_n_clusters, colors, out_dir)
-    plot_cluster_spectra(final_spectra, final_labels, final_n_clusters, wavenumbers, colors, out_dir)
 
-    pixel_offset = 0
-    condition_counts = {meta["condition"]: np.zeros(final_n_clusters, dtype=int) for meta in dir_metadata}
-    # For mapping back per directory when dropping, we need per-directory keep mask derived from drop_mask_global
-    # Build starts from per-directory sizes (counts before optional drop)
-    dir_sizes = [len(idx_pair[0]) for idx_pair in all_indices]
-    dir_starts = np.cumsum([0] + dir_sizes[:-1])
-    reduced_offset = 0  # offset into final_labels sequence
+    pdf_pages = None
+    pdf_path = None
+    if args.pdf:
+        pdf_path = os.path.join(out_dir, "plots.pdf")
+        pdf_pages = PdfPages(pdf_path)
 
-    for i, meta in enumerate(dir_metadata):
-        # filtered pixel indices for this directory
-        r, c = all_indices[i]
-        n_pixels = r.size
-        start, end = dir_starts[i], dir_starts[i] + n_pixels
-        if args.drop_lowest_ptp:
-            local_keep = drop_mask_global[start:end]
-            n_keep = int(local_keep.sum())
-            dir_labels = final_labels[reduced_offset : reduced_offset + n_keep]
-            reduced_offset += n_keep
-            r_kept, c_kept = r[local_keep], c[local_keep]
-        else:
-            dir_labels = final_labels[pixel_offset : pixel_offset + n_pixels]
-            pixel_offset += n_pixels
-            r_kept, c_kept = r, c
+    try:
+        # Use spectra/labels after optional drop so lengths match
+        plot_cluster_umap(final_embedding, final_labels, final_n_clusters, colors, out_dir, pdf_pages=pdf_pages)
+        plot_cluster_spectra(final_spectra, final_labels, final_n_clusters, wavenumbers, colors, out_dir, pdf_pages=pdf_pages)
 
-        stats = analyze_cluster_composition(dir_labels, final_n_clusters)
-        condition_counts[meta["condition"]] += stats["count"].to_numpy()
-        stats.to_csv(os.path.join(meta["dir"], "cluster_stats_combined.csv"), index=False)
-        plot_cluster_composition(stats, final_n_clusters, meta["dir"], tag="combined")
-        map_clusters(dir_labels, all_img_shapes[i], (r_kept, c_kept), final_n_clusters, colors, meta["dir"], tag="combined")
-        print(f"Processed {meta['dir']}.")
+        pixel_offset = 0
+        condition_counts = {meta["condition"]: np.zeros(final_n_clusters, dtype=int) for meta in dir_metadata}
+        # For mapping back per directory when dropping, we need per-directory keep mask derived from drop_mask_global
+        # Build starts from per-directory sizes (counts before optional drop)
+        dir_sizes = [len(idx_pair[0]) for idx_pair in all_indices]
+        dir_starts = np.cumsum([0] + dir_sizes[:-1])
+        reduced_offset = 0  # offset into final_labels sequence
 
-    condition_ratios = {}
-    for cond, counts in condition_counts.items():
-        total = float(counts.sum())
-        condition_ratios[cond] = counts / total if total > 0 else np.zeros_like(counts, dtype=float)
+        for i, meta in enumerate(dir_metadata):
+            # filtered pixel indices for this directory
+            r, c = all_indices[i]
+            n_pixels = r.size
+            start, end = dir_starts[i], dir_starts[i] + n_pixels
+            if args.drop_lowest_ptp:
+                local_keep = drop_mask_global[start:end]
+                n_keep = int(local_keep.sum())
+                dir_labels = final_labels[reduced_offset : reduced_offset + n_keep]
+                reduced_offset += n_keep
+                r_kept, c_kept = r[local_keep], c[local_keep]
+            else:
+                dir_labels = final_labels[pixel_offset : pixel_offset + n_pixels]
+                pixel_offset += n_pixels
+                r_kept, c_kept = r, c
 
-    plot_cluster_composition_by_condition(condition_ratios, out_dir, tag="by_condition")
+            stats = analyze_cluster_composition(dir_labels, final_n_clusters)
+            condition_counts[meta["condition"]] += stats["count"].to_numpy()
+            stats.to_csv(os.path.join(meta["dir"], "cluster_stats_combined.csv"), index=False)
+            plot_cluster_composition(stats, final_n_clusters, meta["dir"], tag="combined")
+            map_clusters(dir_labels, all_img_shapes[i], (r_kept, c_kept), final_n_clusters, colors, meta["dir"], tag="combined")
+            print(f"Processed {meta['dir']}.")
+
+        condition_ratios = {}
+        for cond, counts in condition_counts.items():
+            total = float(counts.sum())
+            condition_ratios[cond] = counts / total if total > 0 else np.zeros_like(counts, dtype=float)
+
+        plot_cluster_composition_by_condition(condition_ratios, out_dir, tag="by_condition", colors=colors, pdf_pages=pdf_pages)
+
+    finally:
+        if pdf_pages is not None:
+            pdf_pages.close()
+            print(f"Saved combined PDF: {pdf_path}")
 
     # Condition-level comparison removed for condition-agnostic combined analysis
     
