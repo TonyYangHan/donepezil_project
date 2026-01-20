@@ -296,7 +296,8 @@ if __name__ == "__main__":
     hide_ns = args.hide_ns
     os.makedirs(args.out, exist_ok=True)
     pdf_pages = PdfPages(os.path.join(args.out, "plots.pdf")) if args.pdf_out else None
-    violin_pdf_pages = None if args.pdf_out else pdf_pages  # Skip adding violins to the combined PDF
+    violin_pdf_pages = None  # Exclude violin plots from PDF output
+    save_png = not args.pdf_out
     if not args.verbose:
         print("Input conditions and directories:")
         for cond, dir_path in zip(args.conds, args.dirs):
@@ -366,8 +367,8 @@ if __name__ == "__main__":
                 print_pairwise(pairwise, f"{metric} (block medians, {region})", sample_unit="blocks")
             p_map = {k: v[0] for k, v in pairwise.items()}
             label_prefix = f"{metric}_{region}"
-            plot_violins_all(blocks, args.conds, p_map, args.out, "Block-median t-test", ylabels.get(metric, metric), label_prefix, hide_ns, violin_pdf_pages)
-            plot_bars_all(blocks, args.conds, p_map, args.out, "Block-median t-test", ylabels.get(metric, metric), label_prefix, hide_ns, pdf_pages)
+            plot_violins_all(blocks, args.conds, p_map, args.out, "Block-median t-test", ylabels.get(metric, metric), label_prefix, hide_ns, violin_pdf_pages, save_png)
+            plot_bars_all(blocks, args.conds, p_map, args.out, "Block-median t-test", ylabels.get(metric, metric), label_prefix, hide_ns, pdf_pages, save_png)
 
     if args.verbose:
         print("\nRunning region size comparisons...")
@@ -381,8 +382,8 @@ if __name__ == "__main__":
             print_pairwise(size_pairwise, f"Region size ({region})", sample_unit="samples")
         size_p_map = {k: v[0] for k, v in size_pairwise.items()}
         label_prefix = f"region_size_{region}"
-        plot_violins_all(size_map, args.conds, size_p_map, args.out, "Region size t-test", size_ylabel, label_prefix, hide_ns, violin_pdf_pages)
-        plot_bars_all(size_map, args.conds, size_p_map, args.out, "Region size t-test", size_ylabel, label_prefix, hide_ns, pdf_pages)
+        plot_violins_all(size_map, args.conds, size_p_map, args.out, "Region size t-test", size_ylabel, label_prefix, hide_ns, violin_pdf_pages, save_png)
+        plot_bars_all(size_map, args.conds, size_p_map, args.out, "Region size t-test", size_ylabel, label_prefix, hide_ns, pdf_pages, save_png)
         if args.verbose:
             mean_sizes = {cond: (float(np.mean(vals)) if len(vals) else float('nan')) for cond, vals in size_map.items()}
             mean_txt = ", ".join(

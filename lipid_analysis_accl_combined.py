@@ -16,7 +16,7 @@ from visualizations import (
 
 
 def filter_small_components(mask, fraction=0.1, min_pixels: int = 5, verbose: bool = False):
-    labeled = measure.label(mask, connectivity=2)
+    labeled = measure.label(mask, connectivity=1) # originally connectivity=2
     props_df = pd.DataFrame(
         measure.regionprops_table(
             labeled, properties=("label", "area", "centroid")
@@ -52,9 +52,31 @@ def filter_small_components(mask, fraction=0.1, min_pixels: int = 5, verbose: bo
 
 
 
-def seg_droplets(root_path, img_path, threshold: float = 1.0, fraction: float = 0.5, min_pixels: int = 5, verbose: bool = False):
+def _load_roi_mask(root_path: str, roi_id: str):
+    for ext in (".png", ".jpg"):
+        mask_path = os.path.join(root_path, f"{roi_id}_mask{ext}")
+        if os.path.exists(mask_path):
+            mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask_img is not None:
+                return mask_img
+    return None
+
+
+def seg_droplets(root_path, img_path, threshold: float = 1.0, fraction: float = 0.5, min_pixels: int = 5, verbose: bool = False, apply_mask: bool = False):
     lipid = cv2.imread(os.path.join(root_path, img_path), cv2.IMREAD_UNCHANGED)
     roi_id = get_number(img_path)
+
+    if apply_mask:
+        roi_mask = _load_roi_mask(root_path, roi_id)
+        if roi_mask is not None:
+            if roi_mask.shape != lipid.shape:
+                roi_mask = cv2.resize(roi_mask, (lipid.shape[1], lipid.shape[0]), interpolation=cv2.INTER_NEAREST)
+            mask_bin = (roi_mask > 0).astype(lipid.dtype)
+            lipid = (lipid.astype(np.float32) * mask_bin).astype(lipid.dtype)
+        else:
+            if verbose:
+                print(f"Mask not found for ROI {roi_id}, proceeding without mask")
+
     roi_dir = os.path.join(root_path, f"roi_{roi_id}")
     os.makedirs(roi_dir, exist_ok=True)
     # Threshold interpreted as "top percentile" (e.g., 1.0 means keep top 1% intensities)
@@ -106,8 +128,10 @@ def tests_droplet_sizes(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pag
     sizes = {cond: pd.concat(dfs, ignore_index=True)["area"].values for cond, dfs in cond_dfs_map.items()}
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(sizes).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "droplet sizes (t-test shown)")
-    plot_bars_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns=hide_ns, pdf_pages=pdf_pages)
-    plot_violins_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    save_png = pdf_pages is None
+    plot_bars_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+    if pdf_pages is None:
+        plot_violins_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
 
 
 def test_centroid_distance(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
@@ -121,23 +145,29 @@ def test_centroid_distance(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_
         distances[cond] = np.asarray(dists)
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(distances).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "centroid distances (t-test shown)")
-    plot_bars_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages)
-    plot_violins_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    save_png = pdf_pages is None
+    plot_bars_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+    if pdf_pages is None:
+        plot_violins_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
 
 
 def test_droplet_counts(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
     counts = {cond: np.asarray([df.shape[0] for df in dfs]) for cond, dfs in cond_dfs_map.items()}
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(counts).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "droplet counts (t-test shown)")
-    plot_bars_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns=hide_ns, pdf_pages=pdf_pages)
-    plot_violins_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    save_png = pdf_pages is None
+    plot_bars_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+    if pdf_pages is None:
+        plot_violins_all(counts, cond_order, pairwise, outdir, "droplet_counts", "Droplet Count", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
 
 
 def test_area_fraction(cond_frac_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(cond_frac_map).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "area fraction (t-test shown)")
-    plot_bars_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages)
-    plot_violins_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages)
+    save_png = pdf_pages is None
+    plot_bars_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+    if pdf_pages is None:
+        plot_violins_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
 
 
 if __name__ == "__main__":
@@ -148,6 +178,7 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", "-t", type=float, default=1.0, help="Top intensity percentile to keep (e.g., 1.0 keeps top 1%)")
     parser.add_argument("--fraction", "-f", type=float, default=0.5, help="Fraction for filtering small components (bottom fraction cutoff)")
     parser.add_argument("--min-pixels", "-m", type=int, default=9, help="Minimum region size (in pixels) to keep in the mask")
+    parser.add_argument("--apply-mask", "-a", action="store_true", help="Apply existing ROI masks (<roi>_mask.png/.jpg) before segmentation")
     parser.add_argument("--workers", "-w", type=int, default=(os.cpu_count() or 1), help="Number of parallel worker processes")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print per-image region counts during segmentation")
     parser.add_argument("--hide-ns", action="store_true", help="Hide non-significant pairwise bars/labels (p >= 0.05)")
@@ -167,7 +198,7 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Directory not found: {dir_path}")
         files = [fname for fname in sorted(os.listdir(dir_path)) if "797" in fname and fname.lower().endswith((".tif", ".tiff"))]
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            futures = {ex.submit(seg_droplets, dir_path, fname, args.threshold, args.fraction, args.min_pixels, args.verbose): fname for fname in files}
+            futures = {ex.submit(seg_droplets, dir_path, fname, args.threshold, args.fraction, args.min_pixels, args.verbose, args.apply_mask): fname for fname in files}
             with tqdm(total=len(futures), desc=f"Segmenting {cond}") as pbar:
                 for fut in as_completed(futures):
                     fname = futures[fut]

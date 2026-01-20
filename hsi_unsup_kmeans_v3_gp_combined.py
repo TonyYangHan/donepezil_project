@@ -315,9 +315,20 @@ if __name__ == "__main__":
         pdf_pages = PdfPages(pdf_path)
 
     try:
+        save_combined_images = not args.pdf
         # Use spectra/labels after optional drop so lengths match
-        plot_cluster_umap(final_embedding, final_labels, final_n_clusters, colors, out_dir, pdf_pages=pdf_pages)
-        plot_cluster_spectra(final_spectra, final_labels, final_n_clusters, wavenumbers, colors, out_dir, pdf_pages=pdf_pages)
+        # Keep UMAP as standalone image only when PDF export is requested
+        plot_cluster_umap(final_embedding, final_labels, final_n_clusters, colors, out_dir, pdf_pages=None)
+        plot_cluster_spectra(
+            final_spectra,
+            final_labels,
+            final_n_clusters,
+            wavenumbers,
+            colors,
+            out_dir,
+            pdf_pages=pdf_pages,
+            save_image=save_combined_images,
+        )
 
         pixel_offset = 0
         condition_counts = {meta["condition"]: np.zeros(final_n_clusters, dtype=int) for meta in dir_metadata}
@@ -355,7 +366,14 @@ if __name__ == "__main__":
             total = float(counts.sum())
             condition_ratios[cond] = counts / total if total > 0 else np.zeros_like(counts, dtype=float)
 
-        plot_cluster_composition_by_condition(condition_ratios, out_dir, tag="by_condition", colors=colors, pdf_pages=pdf_pages)
+        plot_cluster_composition_by_condition(
+            condition_ratios,
+            out_dir,
+            tag="by_condition",
+            colors=colors,
+            pdf_pages=pdf_pages,
+            save_image=save_combined_images,
+        )
 
     finally:
         if pdf_pages is not None:
