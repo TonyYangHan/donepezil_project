@@ -8,6 +8,16 @@ import tifffile
 from matplotlib import cm
 from scipy.stats import pearsonr
 
+PALETTE5 = [
+	"#1f77b4",
+	"#D55E00",
+	"#009E73",
+	"#E69F00",
+	"#CC79A7",
+]
+
+MARKERS5 = ["o", "^", "s", "p", "*"]
+
 # Functions for hyperspectral image clustering plots
 
 
@@ -69,17 +79,52 @@ def annotate_pairs(ax, x_positions, top_y, pvals, step, hide_ns=False):
 		ax.text((x1 + x2) / 2, y + step * 0.15, significance_label(p_val), ha="center", va="bottom", fontsize=10, fontweight="bold")
 
 
-def plot_bars_all(metric_values, cond_order, pairwise_p, outdir, test_name, ylabel, label_prefix=None, hide_ns=False, pdf_pages=None, save_png=True):
-	means, ses = [], []
+def plot_bars_all(
+	metric_values,
+	cond_order,
+	pairwise_p,
+	outdir,
+	test_name,
+	ylabel,
+	label_prefix=None,
+	hide_ns=False,
+	pdf_pages=None,
+	save_png=True,
+	scatter_values=None,
+	bar_width=0.9,
+):
+	means, ses, all_vals_list = [], [], []
+	scatter_source = scatter_values if scatter_values is not None else metric_values
 	for cond in cond_order:
 		vals = np.asarray(metric_values[cond])
+		scatter_vals = np.asarray(scatter_source.get(cond, []))
+		if scatter_vals.size:
+			all_vals_list.append(scatter_vals)
 		means.append(np.mean(vals) if vals.size else 0.0)
 		ses.append(standard_error(vals))
+
+	all_vals = np.concatenate(all_vals_list) if all_vals_list else np.array([])
+
+	color_map = {cond: PALETTE5[idx % len(PALETTE5)] for idx, cond in enumerate(cond_order)}
 
 	x = np.arange(len(cond_order))
 	width = max(6.0, len(cond_order) * 2.4)
 	fig, ax = plt.subplots(figsize=(width, 8))
-	ax.bar(x, means, yerr=ses, capsize=6, alpha=0.85, width=0.9)
+	bar_colors = [color_map[c] for c in cond_order]
+	ax.bar(x, means, yerr=ses, capsize=6, alpha=0.85, width=bar_width, color=bar_colors)
+
+	for idx, cond in enumerate(cond_order):
+		vals = np.asarray(scatter_source.get(cond, []))
+		if not vals.size:
+			continue
+		n_points = vals.size
+		if n_points == 1:
+			offsets = np.array([0.0])
+		else:
+			offsets = np.linspace(-0.12, 0.12, n_points)
+		x_positions = x[idx] + offsets
+		marker = MARKERS5[idx % len(MARKERS5)]
+		ax.scatter(x_positions, vals, color="black", marker=marker, edgecolors="black", linewidths=0.5, zorder=3)
 	ax.set_xticks(x)
 	ax.set_xticklabels(cond_order, rotation=30, ha="right", fontsize=20)
 	ax.set_ylabel(ylabel, fontsize=24)
@@ -87,10 +132,10 @@ def plot_bars_all(metric_values, cond_order, pairwise_p, outdir, test_name, ylab
 	label_txt = label_prefix or test_name
 	ax.set_title(f"{label_txt} ({test_name})")
 
-	span = max(max(means) + max(ses, default=0) - min(means), 1e-6)
-	y_top = max(means) + max(ses, default=0)
-	# Tighter y-limits: less downward and upward padding
-	y_min = max(min(means) - 0.25 * span, 0)
+	data_min = all_vals.min() if all_vals.size else (min(means) if means else 0.0)
+	y_top = max(max(means) + max(ses, default=0), all_vals.max() if all_vals.size else max(means))
+	span = max(y_top - data_min, 1e-6)
+	y_min = data_min - 0.05 * span
 	y_max = y_top + 0.08 * span + 0.04 * span * len(pairwise_p)
 	ax.set_ylim(y_min, y_max)
 
@@ -206,7 +251,7 @@ def plot_cluster_umap(embedding, cluster_labels, n_clusters, colors, output_fold
 def plot_cluster_spectra(spectra, cluster_labels, n_clusters, wavenumbers, colors, output_folder, pdf_pages=None, save_image=True):
 	if spectra.shape[1] == 0:
 		return
-	fig = plt.figure(figsize=(8, 10))
+	fig = plt.figure(figsize=(7, 12))
 	for i in range(n_clusters):
 		mask = cluster_labels == i
 		if np.any(mask):
@@ -228,6 +273,7 @@ def plot_cluster_spectra(spectra, cluster_labels, n_clusters, wavenumbers, color
 
 
 def map_clusters(cluster_labels, img_shape, indices, n_clusters, colors, output_folder, tag: str = "combined", pdf_pages=None):
+	os.makedirs(output_folder, exist_ok=True)
 	label_map = np.full(img_shape[1:], -1, dtype=np.int32)  # -1 = background
 	if cluster_labels.size:
 		label_map[indices] = cluster_labels
@@ -267,7 +313,7 @@ def plot_cluster_composition(cluster_stats, n_clusters, output_folder, tag: str 
 	plt.close(fig)
 
 
-def plot_cluster_composition_by_condition(condition_ratios, output_folder, tag: str = "by_condition", colors=None, pdf_pages=None, save_image=True):
+def plot_cluster_composition_by_condition(condition_ratios, output_folder, tag: str = "by_condition", colors=None, pdf_pages=None, save_image=True, condition_cluster_ratios=None):
 	if not condition_ratios:
 		return
 	conditions = list(condition_ratios.keys())
@@ -279,9 +325,35 @@ def plot_cluster_composition_by_condition(condition_ratios, output_folder, tag: 
 	bar_width = 0.9 / max(n_clusters, 1)
 	shift = (n_clusters - 1) * bar_width / 2.0
 	for k in range(n_clusters):
-		heights = np.array([np.asarray(condition_ratios[c])[k] if len(condition_ratios[c]) > k else 0.0 for c in conditions], dtype=float)
 		color = palette[k % len(palette)] if len(np.atleast_1d(palette)) else None
+		if condition_cluster_ratios is not None:
+			means = []
+			ses = []
+			for cond in conditions:
+				values = np.asarray(condition_cluster_ratios.get(cond, [[]] * n_clusters)[k], dtype=float)
+				values = values[np.isfinite(values)]
+				means.append(float(values.mean()) if values.size else 0.0)
+				ses.append(standard_error(values) if values.size else 0.0)
+			heights = np.asarray(means, dtype=float)
+		else:
+			heights = np.array([np.asarray(condition_ratios[c])[k] if len(condition_ratios[c]) > k else 0.0 for c in conditions], dtype=float)
 		plt.bar(x + k * bar_width - shift, heights, width=bar_width, label=f"Cluster {k+1}", color=color, alpha=0.85)
+
+		if condition_cluster_ratios is not None:
+			for idx, cond in enumerate(conditions):
+				values = np.asarray(condition_cluster_ratios.get(cond, [[]] * n_clusters)[k], dtype=float)
+				values = values[np.isfinite(values)]
+				n_points = values.size
+				x_center = x[idx] + k * bar_width - shift
+				jitter = bar_width * 0.35
+				if n_points <= 1:
+					offsets = np.array([0.0])
+				else:
+					offsets = np.linspace(-jitter, jitter, n_points)
+				x_positions = x_center + offsets
+				ax = plt.gca()
+				ax.scatter(x_positions, values, color=color, edgecolors="black", linewidths=0.4, s=45, alpha=0.9, zorder=3)
+				ax.errorbar(x_center, heights[idx], yerr=ses[idx], color="black", linewidth=1.2, capsize=4, zorder=4)
 	plt.xticks(x, conditions, rotation=45, ha="right", fontsize=20)
 	plt.ylabel("Fraction of spectra per condition", fontsize=24)
 	plt.tick_params(axis="both", labelsize=20)
@@ -296,6 +368,55 @@ def plot_cluster_composition_by_condition(condition_ratios, output_folder, tag: 
 		fig.savefig(svg_path, format="svg")
 		pdf_pages.savefig(fig, bbox_inches="tight")
 	plt.close(fig)
+
+
+def plot_cluster_proportions_by_condition(condition_cluster_ratios, cond_order, output_folder, tag: str = "by_condition_scatter", colors=None, pdf_pages=None, save_image=True):
+	if not condition_cluster_ratios or not cond_order:
+		return
+
+	n_clusters = len(condition_cluster_ratios[cond_order[0]])
+	palette = colors if colors is not None else cm.get_cmap("tab10")(np.linspace(0, 1, max(n_clusters, 1)))
+	x = np.arange(len(cond_order))
+	width = max(6.0, len(cond_order) * 2.4)
+
+	for k in range(n_clusters):
+		fig, ax = plt.subplots(figsize=(width, 7))
+		color = palette[k % len(palette)] if len(np.atleast_1d(palette)) else "royalblue"
+		for idx, cond in enumerate(cond_order):
+			values = np.asarray(condition_cluster_ratios.get(cond, [[]] * n_clusters)[k], dtype=float)
+			values = values[np.isfinite(values)]
+			n_points = values.size
+			if n_points == 0:
+				offsets = np.array([0.0])
+				mean = 0.0
+				se = 0.0
+			else:
+				offsets = np.array([0.0]) if n_points == 1 else np.linspace(-0.12, 0.12, n_points)
+				mean = float(values.mean())
+				se = standard_error(values)
+			x_positions = x[idx] + offsets
+			ax.scatter(x_positions, values, color=color, edgecolors="black", linewidths=0.4, s=55, alpha=0.9, zorder=3)
+			ax.errorbar(x[idx], mean, yerr=se, color="black", linewidth=1.4, capsize=5, zorder=4)
+
+		ax.set_xticks(x)
+		ax.set_xticklabels(cond_order, rotation=30, ha="right", fontsize=20)
+		ax.set_ylabel("Fraction of pixels in cluster", fontsize=24)
+		ax.set_ylim(0, 1)
+		ax.tick_params(axis="both", labelsize=20)
+		ax.set_title(f"Cluster {k+1} proportions by condition")
+		ax.grid(alpha=0.25, axis="y")
+
+		os.makedirs(output_folder, exist_ok=True)
+		fig.tight_layout()
+		fname = f"cluster_{k+1}_proportions_{tag}.png"
+		png_path = os.path.join(output_folder, fname)
+		svg_path = os.path.join(output_folder, fname.rsplit(".", 1)[0] + ".svg")
+		if save_image:
+			fig.savefig(png_path, dpi=300, bbox_inches="tight")
+		if pdf_pages is not None:
+			fig.savefig(svg_path, format="svg")
+			pdf_pages.savefig(fig, bbox_inches="tight")
+		plt.close(fig)
 
 
 # Correlation plots for turnover vs droplet metrics (used by zoom6_corr.py and zoom1_corr.py)

@@ -6,15 +6,15 @@ set -euo pipefail
 INCLUDE_KEY="PE"
 EXCLUDE_KEY="18"
 
-day7_pf="../processed_hyper_1229_prm/day7/"
-day35_pf="../processed_hyper_1229_prm/day35/"
+day7_pf="../../processed_hyper_0331/day7/"
+day35_pf="../../processed_hyper_0331/day35/"
 SCRIPT="prm_process.py"
 
 inputs=(
-	"${day7_pf}1mm/1_hyper_out"
-	"${day7_pf}cl/1_hyper_out" "${day7_pf}cl/3_hyper_out"
-	"${day35_pf}1mm/1_hyper_out"
-	"${day35_pf}cl/1_hyper_out"
+	"${day7_pf}1mm/1_hyper_out" "${day7_pf}1mm/2_hyper_out" "${day7_pf}1mm/3_hyper_out"
+	"${day7_pf}cl/1_hyper_out" "${day7_pf}cl/2_hyper_out" "${day7_pf}cl/3_hyper_out"
+	"${day35_pf}1mm/1_hyper_out" "${day35_pf}1mm/2_hyper_out" "${day35_pf}1mm/3_hyper_out"
+	"${day35_pf}cl/1_hyper_out" "${day35_pf}cl/2_hyper_out" "${day35_pf}cl/3_hyper_out"
 )
 
 for dir in "${inputs[@]}"; do

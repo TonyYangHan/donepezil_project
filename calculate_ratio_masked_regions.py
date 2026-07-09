@@ -13,13 +13,30 @@ from utils import get_number
 from visualizations import plot_bars_all, plot_region_scatter_3d, plot_violins_all, save_ratio_image
 
 # Default parameters (kept lean for debugging)
-REGION_NAMES = ("SEZ", "AL", "LP", "MB")
-BLOCK_SIZE = 32
-BLOCK_MIN_NONZERO = 0.25
+# REGION_NAMES = ("SEZ", "AL", "LP", "MB")
+REGION_NAMES = ("SEZ","AL")
 GAMMA_DEFAULT = 1.0
 CBAR_DEFAULT = "turbo"
 LOW_PCT_DEFAULT = 1.0
 HIGH_PCT_DEFAULT = 99.0
+D2O_PCT = 0.2
+
+
+def _canonical_roi_id(raw: str) -> str:
+    try:
+        return str(int(raw))
+    except Exception:
+        return str(raw)
+
+
+def _trim_extremes(arr: np.ndarray, drop_n: int = 1) -> np.ndarray:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size <= 2 * drop_n:
+        return a
+    order = np.argsort(a)
+    keep = order[drop_n:-drop_n]
+    return a[keep]
 
 
 def load_region_masks(root_path):
@@ -27,7 +44,7 @@ def load_region_masks(root_path):
     for fname in os.listdir(root_path):
         if not fname.lower().endswith(".png"):
             continue
-        roi_id = get_number(fname)
+        roi_id = _canonical_roi_id(get_number(fname))
         region_name = os.path.splitext(fname)[0].split("_")[-1].upper()
         mask = cv2.imread(os.path.join(root_path, fname), cv2.IMREAD_UNCHANGED)
         if mask is None:
@@ -35,11 +52,6 @@ def load_region_masks(root_path):
         if region_name not in REGION_NAMES:
             continue
         region_masks.setdefault(roi_id, {})[region_name] = (mask > 0).astype(np.float32)
-
-    for roi_id, regions in region_masks.items():
-        missing = [r for r in REGION_NAMES if r not in regions]
-        if missing:
-            raise ValueError(f"Missing region masks {missing} for ROI {roi_id} in {root_path}")
     return region_masks
 
 
@@ -51,7 +63,8 @@ def _index_tiffs(file_names, labels):
             continue
         for lab in labels:
             if lab in low:
-                idx[lab][get_number(fname)] = fname
+                roi_id = _canonical_roi_id(get_number(fname))
+                idx[lab][roi_id] = fname
     return idx
 
 
@@ -85,8 +98,14 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
 
     valid = ratio > 0
     if suffix in ["protein_turn", "lipid_turn"] and np.any(valid):
-        vmin, vmax = ratio[valid].min(), ratio[valid].max()
-        ratio[valid] = ((ratio[valid] - vmin) / (vmax - vmin + 1e-8)) * 0.25
+        vals = ratio[valid]
+        p_low, p_high = np.percentile(vals, [0, 99])
+        if p_high > p_low:
+            ratio_clipped = np.clip(ratio, p_low, p_high)
+            scaled = (ratio_clipped - p_low) / (p_high - p_low)
+            ratio[valid] = scaled[valid] * D2O_PCT
+        else:
+            ratio[valid] = 0.0
 
     if region_mask is not None:
         ratio = ratio * region_mask
@@ -106,17 +125,18 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     return ratio
 
 
-def _region_pixel_median(arr):
+def _region_pixel_mean(arr):
     if arr is None:
         return None
     vals = arr[arr > 0]
+    vals = vals[np.isfinite(vals)]
     if vals.size == 0:
         return None
-    return float(np.median(vals))
+    return float(np.mean(vals))
 
 
 def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnover=False,
-                     save=False, **kwargs):
+                     save=False, verbose=False, **kwargs):
     files = os.listdir(root)
     label_list = ["fad", "nadh", "787", "794", "841", "844", "791", "797"]
     idx = _index_tiffs(files, label_list)
@@ -131,8 +151,7 @@ def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnove
     if enable_turnover:
         metrics.extend(["protein_turn", "lipid_turn"])
 
-    data_ratios = {(region, metric): [] for region in REGION_NAMES for metric in metrics}
-    data_medians = {(region, metric): [] for region in REGION_NAMES for metric in metrics}
+    data_means = {(region, metric): [] for region in REGION_NAMES for metric in metrics}
     region_sizes = {region: [] for region in REGION_NAMES}
 
     roi_ids = sorted(set().union(*(set(idx.get(lab, {})) for lab in label_list)))
@@ -166,26 +185,22 @@ def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnove
             if enable_redox and fad_path and nadh_path:
                 ratio = calculate_ratio(root, fad_path, nadh_path, "redox", save,
                                         region_mask=region_mask, region_name=region_name, save_dir=roi_dir, **kwargs)
-                data_ratios[(region_name, "redox")].append(ratio)
-                data_medians[(region_name, "redox")].append(_region_pixel_median(ratio))
+                data_means[(region_name, "redox")].append(_region_pixel_mean(ratio))
 
             if enable_unsat and unsat_path and sat_path:
                 ratio = calculate_ratio(root, unsat_path, sat_path, "unsat", save,
                                         region_mask=region_mask, region_name=region_name, save_dir=roi_dir, **kwargs)
-                data_ratios[(region_name, "unsat")].append(ratio)
-                data_medians[(region_name, "unsat")].append(_region_pixel_median(ratio))
+                data_means[(region_name, "unsat")].append(_region_pixel_mean(ratio))
 
             if enable_turnover:
                 if d_pro_path and pro_path:
                     ratio = calculate_ratio(root, d_pro_path, pro_path, "protein_turn", save,
                                             region_mask=region_mask, region_name=region_name, save_dir=roi_dir, **kwargs)
-                    data_ratios[(region_name, "protein_turn")].append(ratio)
-                    data_medians[(region_name, "protein_turn")].append(_region_pixel_median(ratio))
+                    data_means[(region_name, "protein_turn")].append(_region_pixel_mean(ratio))
                 if d_lip_path and lip_path:
                     ratio = calculate_ratio(root, d_lip_path, lip_path, "lipid_turn", save,
                                             region_mask=region_mask, region_name=region_name, save_dir=roi_dir, **kwargs)
-                    data_ratios[(region_name, "lipid_turn")].append(ratio)
-                    data_medians[(region_name, "lipid_turn")].append(_region_pixel_median(ratio))
+                    data_means[(region_name, "lipid_turn")].append(_region_pixel_mean(ratio))
 
         # Combined-region outputs saved in ROI folder when data channels exist
         if enable_redox and fad_path and nadh_path:
@@ -202,53 +217,7 @@ def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnove
                 calculate_ratio(root, d_lip_path, lip_path, "lipid_turn", save,
                                 region_mask=combined_mask, region_name="ALL", save_dir=roi_dir, tiff_dir=roi_dir, **kwargs)
 
-    return data_ratios, data_medians, region_sizes
-
-
-def _block_medians_from_image(arr: np.ndarray, block_size: int, min_nonzero_prop: float = 0.5) -> np.ndarray:
-    """Compute per-block medians for non-overlapping blocks."""
-    if arr is None:
-        raise ValueError("Input array is None.")
-    a = np.asarray(arr, dtype=float)
-    h, w = a.shape[:2]
-    if h < block_size or w < block_size:
-        raise ValueError("Image is smaller than block size.")
-    bh = h // block_size
-    bw = w // block_size
-    if bh == 0 or bw == 0:
-        raise ValueError("Image is smaller than block size.")
-    a = a[: bh * block_size, : bw * block_size]
-    a4 = a.reshape(bh, block_size, bw, block_size)
-    block_area = float(block_size * block_size)
-    nonzero_counts = (a4 != 0).sum(axis=(1, 3))
-    mask = (nonzero_counts.astype(float) / block_area) >= float(min_nonzero_prop)
-    if not np.any(mask):
-        return np.array([], dtype=float)
-    a4t = a4.transpose(0, 2, 1, 3)
-    kept_blocks = a4t[mask]
-    kept_blocks_nz = np.where(kept_blocks == 0, np.nan, kept_blocks)
-    block_meds_kept = np.nanmedian(kept_blocks_nz, axis=(1, 2))
-    return block_meds_kept
-
-
-def collect_block_medians(cond_ratios, block_size: int = BLOCK_SIZE, min_nonzero_prop: float = 0.5) -> np.ndarray:
-    vals = []
-    for arr in cond_ratios:
-        if arr is None:
-            continue
-        vals.append(_block_medians_from_image(arr, int(block_size), float(min_nonzero_prop)))
-    if len(vals) == 0:
-        return np.array([], dtype=float)
-    return np.concatenate(vals) if len(vals) else np.array([], dtype=float)
-
-
-def collect_pixel_medians(cond_ratios) -> np.ndarray:
-    vals = []
-    for m in cond_ratios:
-        if m is None:
-            continue
-        vals.append(m)
-    return np.asarray(vals, dtype=float) if vals else np.array([], dtype=float)
+    return data_means, region_sizes
 
 
 def pairwise_tests(metric_values):
@@ -275,6 +244,29 @@ def print_pairwise(results, label, sample_unit="samples"):
         print(f"{c1} ({sample_unit}={n1}) vs {c2} ({sample_unit}={n2}) -> t p={t_txt}, U p={u_txt}")
 
 
+def _trim_metric_values(metric_values, drop_n: int = 1, enabled: bool = False):
+    drop_n = max(0, int(drop_n))
+    if not enabled or drop_n == 0:
+        return metric_values
+    trimmed = {}
+    for cond, vals in metric_values.items():
+        original = list(vals)
+        arr = np.asarray(vals, dtype=float)
+        n = len(arr)
+        if n < 3:
+            trimmed_vals = arr
+        else:
+            # Ensure at least 3 points remain after trimming both ends
+            max_drop_each_side = max(0, (n - 3) // 2)
+            eff_drop = min(drop_n, max_drop_each_side)
+            trimmed_vals = _trim_extremes(arr, eff_drop)
+        # If trimming (or nan filtering) dropped everything but we had data, fall back to original
+        if trimmed_vals.size == 0 and len(original) > 0:
+            trimmed_vals = np.asarray(original, dtype=float)
+        trimmed[cond] = trimmed_vals.tolist()
+    return trimmed
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Calculate ratios across multiple conditions and plot group comparisons.")
@@ -287,6 +279,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers", "-w", type=int, default=os.cpu_count(), help="Number of parallel workers (default: os.cpu_count())")
     parser.add_argument("--pdf-out", "-p", action="store_true", help="Save all plots into a single multi-page PDF in the output directory")
     parser.add_argument("--hide-ns", action="store_true", help="Hide non-significant comparisons in plots")
+    parser.add_argument("--trim-extremes", "-t", type=int, default=0, help="Drop N lowest and N highest values per condition before stats/plots (0=disabled)")
     args = parser.parse_args()
 
     if len(args.dirs) != len(args.conds):
@@ -311,8 +304,7 @@ if __name__ == "__main__":
     if args.deuterated:
         metrics.extend(["protein_turn", "lipid_turn"])
 
-    cond_region_ratios = {(region, metric): {cond: [] for cond in args.conds} for region in REGION_NAMES for metric in metrics}
-    cond_region_medians = {(region, metric): {cond: [] for cond in args.conds} for region in REGION_NAMES for metric in metrics}
+    cond_region_means = {(region, metric): {cond: [] for cond in args.conds} for region in REGION_NAMES for metric in metrics}
     cond_region_sizes = {region: {cond: [] for cond in args.conds} for region in REGION_NAMES}
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
@@ -320,34 +312,28 @@ if __name__ == "__main__":
         for cond, dir_path in zip(args.conds, args.dirs):
             if not os.path.isdir(dir_path):
                 raise FileNotFoundError(f"Directory not found: {dir_path}")
-            fut = ex.submit(process_condition, dir_path, True, True, args.deuterated, save, **kwargs)
+            fut = ex.submit(process_condition, dir_path, True, True, args.deuterated, save, args.verbose, **kwargs)
             future_map[fut] = cond
 
         for fut in concurrent.futures.as_completed(future_map):
             cond = future_map[fut]
-            region_ratios, region_medians, region_sizes = fut.result()
+            region_means, region_sizes = fut.result()
 
-            for key in cond_region_ratios:
-                cond_region_ratios[key][cond] = region_ratios.get(key, [])
-                med_list = [m for m in region_medians.get(key, []) if m is not None]
-                cond_region_medians[key][cond] = med_list
+            for key in cond_region_means:
+                cond_region_means[key][cond] = [m for m in region_means.get(key, []) if m is not None]
             for region in REGION_NAMES:
                 cond_region_sizes[region][cond] = region_sizes.get(region, [])
 
             if args.verbose:
                 summary_bits = []
                 for metric in metrics:
-                    count = sum(len(region_ratios.get((r, metric), [])) for r in REGION_NAMES)
+                    count = sum(len(region_means.get((r, metric), [])) for r in REGION_NAMES)
                     summary_bits.append(f"{metric}:{count}")
                 print(f"Processed {cond} -> " + ", ".join(summary_bits))
 
     if args.verbose:
         print("Processing complete.")
-        print("Running block-median tests and plotting group comparisons...")
-
-    def block_map(metric_map):
-        return {cond: collect_block_medians(ratios, block_size=BLOCK_SIZE, min_nonzero_prop=BLOCK_MIN_NONZERO)
-                for cond, ratios in metric_map.items()}
+        print("Running region-level mean tests and plotting group comparisons...")
 
     ylabels = {
         "redox": "Redox ratio",
@@ -359,22 +345,23 @@ if __name__ == "__main__":
     for region in REGION_NAMES:
         for metric in metrics:
             key = (region, metric)
-            blocks = block_map(cond_region_ratios[key])
-            if all(len(v) == 0 for v in blocks.values()):
+            mean_map = _trim_metric_values(cond_region_means[key], drop_n=args.trim_extremes, enabled=bool(args.trim_extremes))
+            if all(len(v) == 0 for v in mean_map.values()):
                 continue
-            pairwise = pairwise_tests(blocks)
+            pairwise = pairwise_tests(mean_map)
             if args.verbose:
-                print_pairwise(pairwise, f"{metric} (block medians, {region})", sample_unit="blocks")
+                print_pairwise(pairwise, f"{metric} (region means, {region})", sample_unit="regions")
             p_map = {k: v[0] for k, v in pairwise.items()}
             label_prefix = f"{metric}_{region}"
-            plot_violins_all(blocks, args.conds, p_map, args.out, "Block-median t-test", ylabels.get(metric, metric), label_prefix, hide_ns, violin_pdf_pages, save_png)
-            plot_bars_all(blocks, args.conds, p_map, args.out, "Block-median t-test", ylabels.get(metric, metric), label_prefix, hide_ns, pdf_pages, save_png)
+            plot_violins_all(mean_map, args.conds, p_map, args.out, "Region-mean t-test", ylabels.get(metric, metric), label_prefix, hide_ns, violin_pdf_pages, save_png)
+            plot_bars_all(mean_map, args.conds, p_map, args.out, "Region-mean t-test", ylabels.get(metric, metric), label_prefix, hide_ns, pdf_pages, save_png)
 
     if args.verbose:
         print("\nRunning region size comparisons...")
     size_ylabel = "Region size (pixels)"
     for region in REGION_NAMES:
         size_map = cond_region_sizes[region]
+        size_map = _trim_metric_values(size_map, drop_n=args.trim_extremes, enabled=bool(args.trim_extremes))
         if all(len(v) == 0 for v in size_map.values()):
             continue
         size_pairwise = pairwise_tests(size_map)
@@ -396,9 +383,9 @@ if __name__ == "__main__":
         for region in REGION_NAMES:
             scatter_vals = {}
             for cond in args.conds:
-                redox_vals = cond_region_medians.get((region, "redox"), {}).get(cond, [])
-                protein_vals = cond_region_medians.get((region, "protein_turn"), {}).get(cond, [])
-                lipid_vals = cond_region_medians.get((region, "lipid_turn"), {}).get(cond, [])
+                redox_vals = cond_region_means.get((region, "redox"), {}).get(cond, [])
+                protein_vals = cond_region_means.get((region, "protein_turn"), {}).get(cond, [])
+                lipid_vals = cond_region_means.get((region, "lipid_turn"), {}).get(cond, [])
                 if not redox_vals or not protein_vals or not lipid_vals:
                     continue
                 scatter_vals[cond] = (

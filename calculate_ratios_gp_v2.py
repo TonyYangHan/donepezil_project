@@ -8,8 +8,6 @@ from utils import get_number, match_files, generate_model_masks
 from visualizations import save_ratio_image, plot_bars_all, plot_violins_all
 
 # Default parameters (no external config)
-BLOCK_SIZE = 32
-BLOCK_MIN_NONZERO = 0.25
 HIDE_NON_SIGNIFICANT = False
 GAMMA_DEFAULT = 1.0
 CBAR_DEFAULT = "turbo"
@@ -17,6 +15,27 @@ LOW_PCT_DEFAULT = 1.0
 HIGH_PCT_DEFAULT = 99.0
 MASK_RX = re.compile(r"^(\d+)_mask$", re.IGNORECASE)
 D2O_PCT = 0.2
+
+
+def _trim_extremes(arr: np.ndarray, drop_n: int = 1) -> np.ndarray:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    drop_n = max(0, int(drop_n))
+    if drop_n == 0 or a.size <= 2 * drop_n:
+        return a
+    order = np.argsort(a)
+    keep = order[drop_n:-drop_n]
+    return a[keep]
+
+
+def _channel_stats(arr: np.ndarray):
+    a = np.asarray(arr, dtype=np.float32)
+    a = np.where(a == 0, np.nan, a)
+    mean = np.nanmean(a)
+    med = np.nanmedian(a)
+    mean = mean if np.isfinite(mean) else np.nan
+    med = med if np.isfinite(med) else np.nan
+    return mean, med
 
 def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
                     mask_map=None, **kwargs):
@@ -54,13 +73,14 @@ def calculate_ratio(root_path, fad_path, nadh_path, suffix, save,
     else:
         raise ValueError("Suffix must be one of 'redox', 'unsat', 'protein_turn', or 'lipid_turn'.")
     
-    # For lipid/protein turnover ratios, min-max scale to [0, 0.25]
     valid = ratio > 0
     if suffix in ["protein_turn", "lipid_turn"] and np.any(valid):
-        vmin, vmax = ratio[valid].min(), ratio[valid].max()
-        if vmax > vmin:
-            scaled = (ratio[valid] - vmin) / (vmax - vmin)
-            ratio[valid] = scaled * D2O_PCT
+        vals = ratio[valid]
+        p_low, p_high = np.percentile(vals, [0, 100])
+        if p_high > p_low:
+            ratio_clipped = np.clip(ratio, p_low, p_high)
+            scaled = (ratio_clipped - p_low) / (p_high - p_low)
+            ratio[valid] = scaled[valid] * D2O_PCT
         else:
             ratio[valid] = 0.0
 
@@ -130,6 +150,7 @@ def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnove
         "unsat": [] if enable_unsat else None,
         "protein_turn": [] if enable_turnover else None,
         "lipid_turn": [] if enable_turnover else None,
+        "d_ratio": [] if enable_turnover else None,
     }
 
     tasks = []
@@ -155,6 +176,47 @@ def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnove
             if lip_path:
                 tasks.append(("lipid_turn", d_lip_path, lip_path))
 
+        # Compute per-ROI d_protein/d_lipid channel stats for downstream ratio comparison
+        shared_ids = sorted(set(d_pro_dict.keys()) & set(d_lip_dict.keys()))
+        for roi_id in shared_ids:
+            d_pro_path = d_pro_dict.get(roi_id)
+            d_lip_path = d_lip_dict.get(roi_id)
+            if not (d_pro_path and d_lip_path):
+                continue
+            pro_img = cv2.imread(os.path.join(root, d_pro_path), cv2.IMREAD_UNCHANGED)
+            lip_img = cv2.imread(os.path.join(root, d_lip_path), cv2.IMREAD_UNCHANGED)
+            if pro_img is None or lip_img is None:
+                continue
+            sat_mask = (pro_img == 4095) | (lip_img == 4095)
+            pro_img[sat_mask] = 0
+            lip_img[sat_mask] = 0
+
+            if mask_map is not None and roi_id in mask_map:
+                roi_mask = mask_map[roi_id]
+                if roi_mask.shape != pro_img.shape:
+                    roi_mask = cv2.resize(roi_mask, (pro_img.shape[1], pro_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+                pro_img = (pro_img.astype(np.float32) * roi_mask).astype(pro_img.dtype)
+                lip_img = (lip_img.astype(np.float32) * roi_mask).astype(lip_img.dtype)
+
+            pro_mean, pro_med = _channel_stats(pro_img)
+            lip_mean, lip_med = _channel_stats(lip_img)
+            data["d_ratio"].append((pro_mean, pro_med, lip_mean, lip_med))
+
+            # Save per-pixel dProtein/dLipid ratio map similar to turnover outputs
+            if save:
+                pro_float = pro_img.astype(np.float32)
+                lip_float = lip_img.astype(np.float32)
+                denom = np.where(lip_float == 0, np.finfo(np.float32).eps, lip_float)
+                ratio_map = pro_float / denom
+                ratio_map[~np.isfinite(ratio_map)] = 0  # Guard against NaN/inf from unexpected values
+                ratio_map = np.clip(ratio_map, 0.0, 2.0)
+
+                roi_dir = os.path.join(root, f"roi_{roi_id}")
+                os.makedirs(roi_dir, exist_ok=True)
+                img_stem = f"{roi_id}_d_pro_over_lip_ratio"
+                save_ratio_image(ratio_map, roi_dir, img_stem + ".png", LOW_PCT_DEFAULT, HIGH_PCT_DEFAULT, kwargs.get("gamma", GAMMA_DEFAULT), kwargs.get("cbar", CBAR_DEFAULT))
+                tiff.imwrite(os.path.join(root, img_stem + ".tiff"), ratio_map.astype(np.float32))
+
     max_workers = max(1, int(workers) if workers is not None else 1)
     if max_workers > 1 and tasks:
         with ProcessPoolExecutor(max_workers=max_workers) as ex:
@@ -172,76 +234,6 @@ def process_condition(root, enable_redox=True, enable_unsat=True, enable_turnove
     return data
 
 
-def _block_medians_from_image(arr: np.ndarray, block_size: int, min_nonzero_prop: float = 0.5) -> np.ndarray:
-    """Compute per-block medians for non-overlapping blocks.
-    Discard blocks whose proportion of non-zero values is below threshold.
-    Returns a 1D array of medians.
-    """
-    if arr is None:
-        raise ValueError("Input array is None.")
-    a = np.asarray(arr, dtype=float)
-    h, w = a.shape[:2]
-    if h < block_size or w < block_size:
-        raise ValueError("Image is smaller than block size.")
-    bh = h // block_size
-    bw = w // block_size
-    if bh == 0 or bw == 0:
-        raise ValueError("Image is smaller than block size.")
-    a = a[: bh * block_size, : bw * block_size]
-    # reshape to (bh, block_size, bw, block_size)
-    a4 = a.reshape(bh, block_size, bw, block_size)
-    # Compute non-zero proportion per block first to avoid All-NaN warnings
-    block_area = float(block_size * block_size)
-    nonzero_counts = (a4 != 0).sum(axis=(1, 3))  # shape (bh, bw)
-    mask = (nonzero_counts.astype(float) / block_area) >= float(min_nonzero_prop)
-    if not np.any(mask):
-        return np.array([], dtype=float)
-    # Reorder axes to (bh, bw, block_size, block_size) to index by 2D mask
-    a4t = a4.transpose(0, 2, 1, 3)
-    kept_blocks = a4t[mask]  # shape: (K, block_size, block_size)
-    # Median over non-zero pixels only
-    kept_blocks_nz = np.where(kept_blocks == 0, np.nan, kept_blocks)
-    block_meds_kept = np.nanmedian(kept_blocks_nz, axis=(1, 2))  # shape (K,)
-    return block_meds_kept
-
-
-def run_block_median_ttest(cond1_block_vals, cond2_block_vals, label: str = "redox"):
-    """Welch's t-test on precomputed block-median arrays for two conditions.
-
-    Inputs are 1D arrays (or array-like) of block medians for each condition.
-    Returns (t_stat, p_val, n_blocks_cond1, n_blocks_cond2). If insufficient data,
-    returns (None, None, 0, 0).
-    """
-    c1 = np.asarray(cond1_block_vals, dtype=float).ravel()
-    c2 = np.asarray(cond2_block_vals, dtype=float).ravel()
-
-    # Drop NaNs just in case
-    c1 = c1[np.isfinite(c1)]
-    c2 = c2[np.isfinite(c2)]
-
-    n1, n2 = c1.size, c2.size
-    if n1 == 0 or n2 == 0:
-        print(f"Block-median t-test for {label}: insufficient data (n1={n1}, n2={n2}).")
-        return None, None, n1, n2
-
-    t_stat, p_val = ttest_ind(c1, c2, equal_var=False)
-    u_stat, p_val_mw = mannwhitneyu(c1, c2)
-    print(f"Block-median t-test for {label}: t={t_stat:.4f}, p={p_val} | n1={n1}, n2={n2}")
-    print(f"Block-median Mann-Whitney U test for {label}: U={u_stat:.4f}, p={p_val_mw}")
-    return t_stat, p_val, n1, n2
-
-
-def collect_block_medians(cond_ratios, block_size: int = 32, min_nonzero_prop: float = 0.5) -> np.ndarray:
-    vals = []
-    for arr in cond_ratios:
-        if arr is None:
-            continue
-        vals.append(_block_medians_from_image(arr, int(block_size), float(min_nonzero_prop)))
-    if len(vals) == 0:
-        return np.array([], dtype=float)
-    return np.concatenate(vals) if len(vals) else np.array([], dtype=float)
-
-
 def collect_image_medians(cond_ratios) -> np.ndarray:
     vals = []
     for arr in cond_ratios:
@@ -252,6 +244,19 @@ def collect_image_medians(cond_ratios) -> np.ndarray:
         med = np.nanmedian(a)
         if np.isfinite(med):
             vals.append(med)
+    return np.asarray(vals, dtype=float)
+
+
+def collect_image_means(cond_ratios) -> np.ndarray:
+    vals = []
+    for arr in cond_ratios:
+        if arr is None:
+            continue
+        a = np.asarray(arr, dtype=float)
+        a = np.where(a == 0, np.nan, a)
+        mean = np.nanmean(a)
+        if np.isfinite(mean):
+            vals.append(mean)
     return np.asarray(vals, dtype=float)
 
 
@@ -295,9 +300,10 @@ if __name__ == "__main__":
     parser.add_argument("--use-model-mask", "-m", action="store_true", help="Use ROI masks; prefer existing '<roi>_mask.jpg' files, otherwise generate with model weights")
     parser.add_argument("--mask-weights", "-mw", type=str, default=None, help="Path to the MultiScaleUNet mask weights (.pth)")
     parser.add_argument("--mask-threshold", "-mt", type=float, default=0.5, help="Sigmoid threshold for binarizing the predicted mask")
-    parser.add_argument("--image-median", "-i", action="store_true", help="Run stats on per-image medians instead of block medians")
+    parser.add_argument("--image-median", "-i", action="store_true", help="Run stats on per-image medians instead of per-image means")
     parser.add_argument("--pdf-out", "-p", action="store_true", help="Save all plots into a single multi-page PDF in the output directory")
     parser.add_argument("--hide-ns", action="store_true", help="Hide non-significant comparisons in plots")
+    parser.add_argument("--trim-extremes", "-t", type=int, default=0, help="Drop N lowest and N highest values per condition before stats/plots (0=disabled)")
     args = parser.parse_args()
 
     if len(args.dirs) != len(args.conds):
@@ -323,6 +329,7 @@ if __name__ == "__main__":
     cond_unsat = {cond: [] for cond in args.conds} if enable_unsat else None
     cond_turn_protein = {cond: [] for cond in args.conds} if args.deuterated else None
     cond_turn_lipid = {cond: [] for cond in args.conds} if args.deuterated else None
+    cond_d_ratio = {cond: [] for cond in args.conds} if args.deuterated else None
 
     for cond, dir_path in zip(args.conds, args.dirs):
         if not os.path.isdir(dir_path):
@@ -363,6 +370,8 @@ if __name__ == "__main__":
             cond_turn_protein[cond] = data.get("protein_turn", [])
         if cond_turn_lipid is not None:
             cond_turn_lipid[cond] = data.get("lipid_turn", [])
+        if cond_d_ratio is not None:
+            cond_d_ratio[cond] = data.get("d_ratio", [])
 
         if args.verbose:
             print(f"Processed {cond}: {len(data.get('redox') or [])} redox, {len(data.get('unsat') or [])} unsat, "
@@ -378,14 +387,33 @@ if __name__ == "__main__":
         stat_label = "Image-median t-test"
     else:
         def agg_fn(ratios):
-            return collect_block_medians(ratios, block_size=BLOCK_SIZE, min_nonzero_prop=BLOCK_MIN_NONZERO)
-        stat_label = "Block-median t-test"
+            return collect_image_means(ratios)
+        stat_label = "Image-mean t-test"
 
     def metric_map(metric_map):
         return {cond: agg_fn(ratios) for cond, ratios in metric_map.items()}
 
+    def trim_metric_values(metric_values):
+        drop_n = max(0, int(args.trim_extremes or 0))
+        if drop_n == 0:
+            return metric_values
+        return {cond: _trim_extremes(vals, drop_n=drop_n) for cond, vals in metric_values.items()}
+
+    def d_ratio_values(stat_map):
+        vals = {}
+        for cond, stats in stat_map.items():
+            res = []
+            for pro_mean, pro_med, lip_mean, lip_med in stats:
+                num = pro_med if use_image_median else pro_mean
+                den = lip_med if use_image_median else lip_mean
+                if den is None or not np.isfinite(den) or den <= 0 or num is None or not np.isfinite(num):
+                    continue
+                res.append(num / den)
+            vals[cond] = np.asarray(res, dtype=float)
+        return vals
+
     if cond_redox is not None:
-        redox_blocks = metric_map(cond_redox)
+        redox_blocks = trim_metric_values(metric_map(cond_redox))
         redox_pairwise = pairwise_tests(redox_blocks)
         print_pairwise(redox_pairwise, "redox (" + stat_label + ")")
         redox_p = {k: v[0] for k, v in redox_pairwise.items()}
@@ -393,7 +421,7 @@ if __name__ == "__main__":
         plot_bars_all(redox_blocks, args.conds, redox_p, args.out, stat_label, "Redox ratio", "redox", hide_ns, pdf_pages, save_png)
 
     if cond_unsat is not None:
-        unsat_blocks = metric_map(cond_unsat)
+        unsat_blocks = trim_metric_values(metric_map(cond_unsat))
         unsat_pairwise = pairwise_tests(unsat_blocks)
         print_pairwise(unsat_pairwise, "unsaturation (" + stat_label + ")")
         unsat_p = {k: v[0] for k, v in unsat_pairwise.items()}
@@ -401,8 +429,15 @@ if __name__ == "__main__":
         plot_bars_all(unsat_blocks, args.conds, unsat_p, args.out, stat_label, "Unsaturation ratio", "unsat", hide_ns, pdf_pages, save_png)
 
     if args.deuterated:
-        pt_blocks = metric_map(cond_turn_protein)
-        lt_blocks = metric_map(cond_turn_lipid)
+        d_ratio_blocks = trim_metric_values(d_ratio_values(cond_d_ratio))
+        d_ratio_pairwise = pairwise_tests(d_ratio_blocks)
+        print_pairwise(d_ratio_pairwise, "d_protein/d_lipid (" + stat_label + ")")
+        d_ratio_p = {k: v[0] for k, v in d_ratio_pairwise.items()}
+        plot_violins_all(d_ratio_blocks, args.conds, d_ratio_p, args.out, stat_label, "dProtein/dLipid channel ratio", "d_pro_over_lip", hide_ns, pdf_pages_violin, save_png)
+        plot_bars_all(d_ratio_blocks, args.conds, d_ratio_p, args.out, stat_label, "dProtein/dLipid channel ratio", "d_pro_over_lip", hide_ns, pdf_pages, save_png)
+
+        pt_blocks = trim_metric_values(metric_map(cond_turn_protein))
+        lt_blocks = trim_metric_values(metric_map(cond_turn_lipid))
         pt_pairwise = pairwise_tests(pt_blocks)
         lt_pairwise = pairwise_tests(lt_blocks)
         print_pairwise(pt_pairwise, "protein turnover (" + stat_label + ")")

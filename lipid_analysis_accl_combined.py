@@ -97,8 +97,27 @@ def seg_droplets(root_path, img_path, threshold: float = 1.0, fraction: float = 
     droplet_pixels = int(mask_binary.sum())
     area_fraction = (droplet_pixels / total_pixels) if total_pixels else 0.0
 
+    # Average distance from each droplet centroid to nearest zero-intensity pixel within the ROI
+    centroid_zero_mean = np.nan
+    if props_df is not None and not props_df.empty:
+        zero_pixels = np.size(lipid) - int(np.count_nonzero(lipid))
+        if zero_pixels > 0:
+            nonzero_mask = (lipid > 0).astype(np.uint8)
+            dist_map = cv2.distanceTransform(nonzero_mask, cv2.DIST_L2, 3)
+            centroids = props_df[["centroid-0", "centroid-1"]].values
+            h, w = dist_map.shape
+            dists = []
+            for cy, cx in centroids:
+                y = min(max(int(round(cy)), 0), h - 1)
+                x = min(max(int(round(cx)), 0), w - 1)
+                dists.append(float(dist_map[y, x]))
+            if dists:
+                centroid_zero_mean = float(np.mean(dists))
+        else:
+            centroid_zero_mean = 0.0
+
     # Return properties dataframe and per-image area fraction
-    return props_df, area_fraction
+    return props_df, area_fraction, centroid_zero_mean
 
 
 def pairwise_tests(metric_values):
@@ -116,6 +135,31 @@ def pairwise_tests(metric_values):
     return results
 
 
+def _trim_extremes(arr: np.ndarray, drop_n: int = 1) -> np.ndarray:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    drop_n = max(0, int(drop_n))
+    if drop_n == 0 or a.size <= 2 * drop_n:
+        return a
+    order = np.argsort(a)
+    keep = order[drop_n:-drop_n]
+    return a[keep]
+
+
+def _trim_metric_values(metric_values, drop_n: int = 0):
+    drop_n = max(0, int(drop_n))
+    if drop_n == 0:
+        return metric_values
+    trimmed = {}
+    for cond, vals in metric_values.items():
+        vals = np.asarray(vals, dtype=float)
+        if vals.size <= 2 * drop_n:
+            trimmed[cond] = vals
+        else:
+            trimmed[cond] = _trim_extremes(vals, drop_n)
+    return trimmed
+
+
 def print_pairwise(results, label):
     print(f"\nPairwise stats for {label}:")
     for (c1, c2), (p_t, p_u) in results.items():
@@ -125,9 +169,13 @@ def print_pairwise(results, label):
 
 
 def tests_droplet_sizes(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
-    sizes = {cond: pd.concat(dfs, ignore_index=True)["area"].values for cond, dfs in cond_dfs_map.items()}
+    sizes = {
+        cond: np.asarray([df["area"].mean() for df in dfs if not df.empty], dtype=float)
+        for cond, dfs in cond_dfs_map.items()
+    }
+    sizes = _trim_metric_values(sizes, drop_n=TRIM_EXTREMES)
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(sizes).items()}
-    print_pairwise({k: (p, None) for k, p in pairwise.items()}, "droplet sizes (t-test shown)")
+    print_pairwise({k: (p, None) for k, p in pairwise.items()}, "droplet sizes (ROI mean, t-test shown)")
     save_png = pdf_pages is None
     plot_bars_all(sizes, cond_order, pairwise, outdir, "droplet_sizes", "Droplet Size", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
     if pdf_pages is None:
@@ -137,22 +185,24 @@ def tests_droplet_sizes(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pag
 def test_centroid_distance(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
     distances = {}
     for cond, dfs in cond_dfs_map.items():
-        dists = []
+        per_roi_means = []
         for df in dfs:
             centroids = df[["centroid-0", "centroid-1"]].values
             if len(centroids) > 1:
-                dists += pdist(centroids).tolist()
-        distances[cond] = np.asarray(dists)
+                dists = pdist(centroids)
+                if dists.size:
+                    per_roi_means.append(float(np.mean(dists)))
+        distances[cond] = np.asarray(per_roi_means, dtype=float)
+    distances = _trim_metric_values(distances, drop_n=TRIM_EXTREMES)
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(distances).items()}
-    print_pairwise({k: (p, None) for k, p in pairwise.items()}, "centroid distances (t-test shown)")
+    print_pairwise({k: (p, None) for k, p in pairwise.items()}, "centroid distances (ROI mean, t-test shown)")
     save_png = pdf_pages is None
     plot_bars_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
-    if pdf_pages is None:
-        plot_violins_all(distances, cond_order, pairwise, outdir, "pairwise_distances", "Pairwise Distance", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
 
 
 def test_droplet_counts(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
     counts = {cond: np.asarray([df.shape[0] for df in dfs]) for cond, dfs in cond_dfs_map.items()}
+    counts = _trim_metric_values(counts, drop_n=TRIM_EXTREMES)
     pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(counts).items()}
     print_pairwise({k: (p, None) for k, p in pairwise.items()}, "droplet counts (t-test shown)")
     save_png = pdf_pages is None
@@ -162,12 +212,25 @@ def test_droplet_counts(cond_dfs_map, cond_order, outdir, hide_ns=False, pdf_pag
 
 
 def test_area_fraction(cond_frac_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
-    pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(cond_frac_map).items()}
-    print_pairwise({k: (p, None) for k, p in pairwise.items()}, "area fraction (t-test shown)")
+    cond_frac_pct = {cond: np.asarray(vals, dtype=float) * 100.0 for cond, vals in cond_frac_map.items()}
+    cond_frac_pct = _trim_metric_values(cond_frac_pct, drop_n=TRIM_EXTREMES)
+    pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(cond_frac_pct).items()}
+    print_pairwise({k: (p, None) for k, p in pairwise.items()}, "area fraction (%) (t-test shown)")
     save_png = pdf_pages is None
-    plot_bars_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+    plot_bars_all(cond_frac_pct, cond_order, pairwise, outdir, "area_fraction", "Droplet Area (%)", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
     if pdf_pages is None:
-        plot_violins_all(cond_frac_map, cond_order, pairwise, outdir, "area_fraction", "Droplet Area Fraction", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+        plot_violins_all(cond_frac_pct, cond_order, pairwise, outdir, "area_fraction", "Droplet Area (%)", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+
+
+def test_centroid_zero_distance(cond_centroid_zero_map, cond_order, outdir, hide_ns=False, pdf_pages=None):
+    distances = {cond: np.asarray(vals, dtype=float) for cond, vals in cond_centroid_zero_map.items()}
+    distances = _trim_metric_values(distances, drop_n=TRIM_EXTREMES)
+    pairwise = {(c1, c2): p[0] for (c1, c2), p in pairwise_tests(distances).items()}
+    print_pairwise({k: (p, None) for k, p in pairwise.items()}, "centroid-to-zero distance (t-test shown)")
+    save_png = pdf_pages is None
+    plot_bars_all(distances, cond_order, pairwise, outdir, "centroid_zero_distance", "Centroid->Zero Distance (px)", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
+    if pdf_pages is None:
+        plot_violins_all(distances, cond_order, pairwise, outdir, "centroid_zero_distance", "Centroid->Zero Distance (px)", hide_ns=hide_ns, pdf_pages=pdf_pages, save_png=save_png)
 
 
 if __name__ == "__main__":
@@ -175,14 +238,15 @@ if __name__ == "__main__":
     parser.add_argument("dirs", nargs="+", type=str, help="Input directories for each condition")
     parser.add_argument("--conds", "-c", nargs="+", required=True, help="Condition names (match order of dirs)")
     parser.add_argument("--out", "-o", type=str, required=True, help="Output directory for plots")
-    parser.add_argument("--threshold", "-t", type=float, default=1.0, help="Top intensity percentile to keep (e.g., 1.0 keeps top 1%)")
-    parser.add_argument("--fraction", "-f", type=float, default=0.5, help="Fraction for filtering small components (bottom fraction cutoff)")
+    parser.add_argument("--threshold", "-t", type=float, default=2.0, help="Top intensity percentile to keep (e.g., 1.0 keeps top 1%)")
+    parser.add_argument("--fraction", "-f", type=float, default=0.75, help="Fraction for filtering small components (bottom fraction cutoff)")
     parser.add_argument("--min-pixels", "-m", type=int, default=9, help="Minimum region size (in pixels) to keep in the mask")
     parser.add_argument("--apply-mask", "-a", action="store_true", help="Apply existing ROI masks (<roi>_mask.png/.jpg) before segmentation")
     parser.add_argument("--workers", "-w", type=int, default=(os.cpu_count() or 1), help="Number of parallel worker processes")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print per-image region counts during segmentation")
     parser.add_argument("--hide-ns", action="store_true", help="Hide non-significant pairwise bars/labels (p >= 0.05)")
     parser.add_argument("--pdf-out", "-p", type=str, default=None, help="Optional path to save all plots into a single multi-page PDF")
+    parser.add_argument("--trim-extremes", "-x", type=int, default=0, help="Drop N lowest and N highest values per condition before stats/plots")
     args = parser.parse_args()
 
     if len(args.dirs) != len(args.conds):
@@ -192,6 +256,8 @@ if __name__ == "__main__":
 
     cond_dfs_map = {cond: [] for cond in args.conds}
     cond_frac_map = {cond: [] for cond in args.conds}
+    cond_centroid_zero_map = {cond: [] for cond in args.conds}
+    TRIM_EXTREMES = max(0, int(args.trim_extremes or 0))
 
     for cond, dir_path in zip(args.conds, args.dirs):
         if not os.path.isdir(dir_path):
@@ -203,9 +269,11 @@ if __name__ == "__main__":
                 for fut in as_completed(futures):
                     fname = futures[fut]
                     try:
-                        props_df, area_fraction = fut.result()
+                        props_df, area_fraction, centroid_zero_mean = fut.result()
                         # Record fraction even if no droplets found for that image
                         cond_frac_map[cond].append(area_fraction)
+                        if np.isfinite(centroid_zero_mean):
+                            cond_centroid_zero_map[cond].append(centroid_zero_mean)
                         if props_df is not None and not props_df.empty:
                             cond_dfs_map[cond].append(props_df)
                     except Exception as e:
@@ -222,6 +290,7 @@ if __name__ == "__main__":
         test_centroid_distance(cond_dfs_map, args.conds, args.out, args.hide_ns, pdf_pages)
         test_droplet_counts(cond_dfs_map, args.conds, args.out, args.hide_ns, pdf_pages)
         test_area_fraction(cond_frac_map, args.conds, args.out, args.hide_ns, pdf_pages)
+        test_centroid_zero_distance(cond_centroid_zero_map, args.conds, args.out, args.hide_ns, pdf_pages)
     finally:
         if pdf_pages is not None:
             pdf_pages.close()
